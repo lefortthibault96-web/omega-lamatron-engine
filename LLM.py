@@ -3,6 +3,7 @@ from pathlib import Path
 import ollama
 from rich.console import Console
 from config import DEFAULT_MODEL, safe_resolve, read_vault_file
+import tiktoken
 
 console = Console()
 # ---------- Agent ----------
@@ -124,3 +125,49 @@ class OllamaAgent:
         if hasattr(resp, "message") and hasattr(resp.message, "content"):
             return str(resp.message.content).strip()
         return str(resp).strip()
+    
+
+    def count_tokens(
+        self,
+        messages: list[dict] = None,
+        model_to_use: str = None,
+        return_breakdown: bool = False,
+        include_history: bool = True
+    ):
+        """
+        Count tokens for a list of messages, optionally including assistant messages from history.
+        Returns total tokens and breakdown per role.
+        """
+        import tiktoken
+
+        if model_to_use is None:
+            model_to_use = self.model
+
+        try:
+            encoding = tiktoken.encoding_for_model(model_to_use)
+        except KeyError:
+            encoding = tiktoken.get_encoding("cl100k_base")
+
+        # Gather messages
+        all_messages = messages.copy() if messages else []
+
+        if include_history:
+            # Include previous assistant outputs if available
+            history = getattr(self, "_conversation_history", [])
+            all_messages = history + all_messages
+
+        total_tokens = 0
+        breakdown = {}
+
+        for msg in all_messages:
+            role = msg.get("role", "unknown")
+            content = msg.get("content", "")
+            msg_tokens = len(encoding.encode(role)) + len(encoding.encode(content)) + 4  # message overhead
+            total_tokens += msg_tokens
+            breakdown[role] = breakdown.get(role, 0) + msg_tokens
+
+        total_tokens += 2  # priming overhead
+
+        if return_breakdown:
+            return total_tokens, breakdown
+        return total_tokens

@@ -89,7 +89,9 @@ class GMInterface:
                 speaker_name=speaker_name,
             )
 
-        # -----------------------------------------------------------------
+        # Count Tokens
+        tokens_used, breakdown = self.agent.count_tokens(messages, model_to_use=self.agent.model, return_breakdown=True)
+        print(f"[Token Usage] {tokens_used} tokens: {breakdown}")
 
         # Store for retry
         self.agent._last_user_message_for_retry = messages
