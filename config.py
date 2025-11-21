@@ -3,7 +3,7 @@ from pathlib import Path
 DEFAULT_MODEL = "fluffy/l3-8b-stheno-v3.2"
 MODEL = "dolphin3:8b"  # optional, if you need both
 
-vault = Path(r"E:\\Users\\Tibo\\Obsidian\\PNJisme\\PNJisme\\Risus").resolve()
+vault = Path(r"E:\\Users\\Tibo\\Obsidian\\PNJisme\\PNJisme\\LAMATRON").resolve()
 characters = vault / "Characters" / "Active"
 scenes_active = vault / "Scenes" / "Active"
 prompts_dir = vault / "Prompts"
@@ -19,4 +19,5 @@ def read_vault_file(vault_root: Path, rel_path: str) -> str:
     p = safe_resolve(vault_root, rel_path)
     if not p.exists():
         return ""
+
     return p.read_text(encoding="utf-8")
