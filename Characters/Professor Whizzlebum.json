@@ -1,0 +1,67 @@
+{
+  "description": "Small, round, and perpetually soot-stained. Talks too fast, forgets what he’s saying halfway through, and somehow manages to blow something up at least once a day. Claims every explosion is “a feature, not a bug.” Travels with a mechanical pigeon named Percival who’s _probably_ smarter than he is.",
+  "clichés": [
+    {
+      "name": "Inventor",
+      "rank": 4,
+      "tools_of_the_trade": [
+        "A multi-pocketed lab coat full of unidentifiable gadgets",
+        "Goggles with multiple flip-down lenses (most cracked, some tinted weirdly)",
+        "A collapsible workbench that unfolds from a suitcase",
+        "Percival, the mechanical pigeon — doubles as a recorder, scout, and sometimes a flamethrower"
+      ],
+      "likely_abilities": [
+        "Design and build improbable contraptions on the fly",
+        "Reverse-engineer or jury-rig devices from scraps",
+        "Recognize and exploit weaknesses in mechanisms",
+        "Convincingly declare disasters as “intentional prototypes”"
+      ]
+    },
+    {
+      "name": "Absent-Minded Professor",
+      "rank": 3,
+      "tools_of_the_trade": [
+        "A stack of half-filled notebooks with no consistent numbering",
+        "Ink-stained fingers and a perpetually misplaced pen",
+        "A head full of brilliant, half-remembered theories"
+      ],
+      "likely_abilities": [
+        "Spout obscure scientific trivia or academic jargon at will",
+        "Accidentally stumble onto \"genius-level\" solutions",
+        "Forget key details in hilarious or inconvenient ways"
+      ]
+    },
+    {
+      "name": "Tinkering Gadgeteer",
+      "rank": 2,
+      "tools_of_the_trade": [
+        "Tiny screwdriver set and magnifying monocle",
+        "Percival’s toolkit hidden in his chest compartment"
+      ],
+      "likely_abilities": [
+        "Repair or upgrade any mechanical device (with varying success)",
+        "Create quick mechanical distractions or traps",
+        "Fine-tune or sabotage clockwork, steampunk, or magitech mechanisms"
+      ]
+    },
+    {
+      "name": "Tea Enthusiast",
+      "rank": 1,
+      "tools_of_the_trade": [
+        "A dented silver teapot with scorch marks",
+        "Ceramic cup that says “World’s 3rd Best Genius”"
+      ],
+      "likely_abilities": [
+        "Brew restorative or mood-improving tea under any conditions",
+        "Impress or distract with perfect tea ceremony etiquette",
+        "Use tea as an impromptu solvent, polish, or cooling agent"
+      ]
+    }
+  ],
+  "other_stuff": {
+    "memories": [
+      "Ah, yes — the time I accidentally turned the dean’s wig into a small weather system; quite the learning experience in localized barometric pressure!",
+      "Percival once outscored me on an intelligence test I built — though, in my defense, I hadn’t finished calibrating the sarcasm sensors."
+    ]
+  }
+}
