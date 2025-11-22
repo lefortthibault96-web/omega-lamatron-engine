@@ -7,4 +7,3 @@ python "E:\Users\Tibo\Obsidian\PNJisme\PNJisme\LAMATRON\ollama_ttrpg_agent.py"
 
 REM Pause so you can see any messages when it exits
 pause
-

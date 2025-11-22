@@ -3,7 +3,6 @@ from pathlib import Path
 import ollama
 from rich.console import Console
 from config import DEFAULT_MODEL, safe_resolve, read_vault_file
-import tiktoken
 
 console = Console()
 # ---------- Agent ----------

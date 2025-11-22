@@ -8,6 +8,7 @@ from dice import roll_dice
 from LLM import OllamaAgent
 from Prompt_Manager2000 import PromptManager
 from config import DEFAULT_MODEL, safe_resolve, read_vault_file, vault, characters, scenes_active, prompts_dir
+from turns import ensure_current_turn, advance_turn, summarize_scene_turns
 
 # ---------- Configuration ----------
 active_char = None
@@ -36,7 +37,7 @@ class GMInterface:
 
         self.current_submode = current_submode
         self.submode_text = self.pm.submode(current_submode)
-
+        self.pm.scene_text = self.agent.read_active_scene()
         # Cached base prompts
         self.SYSTEM_PROMPT = self.pm.system_prompt()
         self.CHARACTER_INSTRUCTIONS = self.pm.character_instructions()
@@ -48,25 +49,26 @@ class GMInterface:
     # ------------------- NEW HELPER -------------------
     def _send_to_llm(self, user_input: str):
         """
-        Send GM input to the LLM, build correct prompt through PromptManager,
-        append output to scene, store messages for retry.
+        Send GM input to the LLM, using a collapsed scene (summaries for old turns)
+        instead of the full scene, append output to scene, store messages for retry.
         """
 
-        scene_before_input = self.agent.read_active_scene()
-        speaker_name = self.agent.character_names[self.agent.active_character_index]
-
-        # Append GM input to scene
+        # --- Append GM input first ---
         if user_input.strip():
             self.agent.append_to_active_scene(f"GM : {user_input}")
 
-        # ----------- BUILD MESSAGE LIST THROUGH PromptManager -----------
+        # --- Build collapsed scene for LLM ---
+        shortened_scene = self.pm.build_scene_text(self.pm.scene_text)
 
+        speaker_name = self.agent.character_names[self.agent.active_character_index]
+
+        # --- Build messages based on submode ---
         if self.current_submode == "group":
             group_prompt = self.pm.build_group_system_prompt(self.agent)
             messages = self.pm.build_group_messages(
                 system_prompt=self.SYSTEM_PROMPT,
                 group_prompt=group_prompt,
-                scene_text=scene_before_input,
+                shortened_scene=shortened_scene,  # <<< use collapsed scene
                 user_input=user_input,
             )
             speaker_name = "Group"
@@ -84,23 +86,30 @@ class GMInterface:
                 character_instructions=self.CHARACTER_INSTRUCTIONS,
                 submode_instructions=self.submode_text,
                 character_sheet=active_char_sheet,
-                scene_before_input=scene_before_input,
+                shortened_scene=shortened_scene,  # <<< use collapsed scene
                 user_input=user_input,
                 speaker_name=speaker_name,
             )
 
-        # Count Tokens
-        tokens_used, breakdown = self.agent.count_tokens(messages, model_to_use=self.agent.model, return_breakdown=True)
-        print(f"[Token Usage] {tokens_used} tokens: {breakdown}")
+        # --- Count tokens ---
+        tokens_used, breakdown = self.agent.count_tokens(
+            messages, model_to_use=self.agent.model, return_breakdown=True
+        )
+        console.print(f"[Token Usage] {tokens_used} tokens: {breakdown}")
+        self.agent._last_token_usage = tokens_used
 
-        # Store for retry
+        # --- Check against model limit ---
+        from config import DEFAULT_MODEL_TOKEN_LIMIT, check_context_usage
+        check_context_usage(tokens_used, DEFAULT_MODEL_TOKEN_LIMIT)
+
+        # --- Store for retry ---
         self.agent._last_user_message_for_retry = messages
         self.agent._last_user_message_for_retry_user_text = user_input
 
-        # LLM call
+        # --- Call LLM ---
         response = self.agent.chat(messages)
 
-        # Normalize & append
+        # --- Normalize & append ---
         char_response = self.normalize_llm_output(response, speaker_name)
         console.print(char_response)
         self.agent.append_llm_output(char_response)
@@ -113,21 +122,26 @@ class GMInterface:
         self._send_to_llm("")
 
     def show_help(self):
-        console.print("""
-[bold cyan]Available Commands:[/bold cyan]
+        help_text = """
+    [bold cyan]Available Commands:[/bold cyan]
 
-/h       - Show help
-/r <dice>- Roll dice
-/c       - Combat submode
-/e       - Exploration submode
-/r       - Roleplay submode
-/s       - Summarize scene
-/p       - Regenerate last LLM message (retry)
-/b       - Rollback last GM message
-/ls      - List characters
-/n       - Next character
-/1 /2 /3 - Switch active character
-""")
+    /h       - Show help
+    /r <dice>- Roll dice
+    /c       - Combat submode
+    /e       - Exploration submode
+    /r       - Roleplay submode
+    /g       - Group submode
+    /s <n>   - Summarize scene. Optionally keep the last N turns unsummarized (default uses config value)
+    /p       - Regenerate last LLM message (retry)
+    /ls      - List characters
+    /n       - Next character
+    /1 /2 /3 - Switch active character
+    /t       - Next turn
+    *        - Toggle auto-mode (when True, upon empty user input, switches to next character then sends)
+    .        - Append GM text in scene file without summoning LLM
+    """
+        console.print(help_text)
+        return help_text
 
     def normalize_llm_output(self, response: str, speaker_name: str) -> str:
         """
@@ -191,71 +205,23 @@ class GMInterface:
             console.print("[red]Invalid dice expression[/red]")
 
 
-    def summarize_scene(self):
-        scene_text = self.agent.read_active_scene()
-        if not scene_text.strip():
-            console.print("[No scene text to summarize]", style="bold red")
-            return
-
-        # ----- LLM summary using summary_system.md -----
-
-        console.print("[cyan]Summarizing scene…[/cyan]")
-        summary_messages = self.pm.build_summary_messages(scene_text)
-        scene_summary = self.agent.chat(summary_messages).strip()
-
-        # ----- Write updated scene -----
-        new_scene_text = f"# Summary :\n{scene_summary}\n\n# Details :\n{scene_text}"
-
+    def summarize_scene(self, turns_to_keep: int = None):
+        """
+        Manual trigger for auto-summarizing old turns.
+        Optional: specify number of recent turns to keep unsummarized.
+        """
         abs_scene_path = self.agent.get_active_scene_path()
-        if abs_scene_path:
-            abs_scene_path.write_text(new_scene_text, encoding="utf-8")
-            console.print("[bold cyan]Scene summary added to top.[/bold cyan]")
-        else:
-            console.print("[red]No active scene file found.[/red]")
+
+        if not abs_scene_path or not abs_scene_path.exists():
+            console.print("[red]No active scene file to summarize.[/red]")
             return
 
-        # ----- Per-character memories -----
-        for char_path in self.agent.character_paths:
-            char_name = char_path.stem
-            char_sheet = read_vault_file(
-                self.agent.vault_root,
-                str(char_path.relative_to(self.agent.vault_root))
-            )
+        console.print("[cyan]Manually summarizing old turns…[/cyan]")
 
-            console.print(f"[cyan]Generating memory for {char_name}…[/cyan]")
-            memory_messages = self.pm.build_memory_messages(scene_text, char_name, char_sheet)
-            memory_sentence = self.agent.chat(memory_messages).strip()
+        # Trigger the turn-by-turn summarizer
+        summarize_scene_turns(abs_scene_path, self.agent, turns_to_keep=turns_to_keep)
 
-            # Insert the memory into the character sheet
-            lines = char_sheet.splitlines()
-
-            memory_indices = [
-                (i, line) for i, line in enumerate(lines)
-                if re.match(r"#+\s*memories?", line, re.I)
-            ]
-
-            if memory_indices:
-                memory_indices.sort(key=lambda x: len(re.match(r"(#+)", x[1]).group(1)))
-                header_index = memory_indices[0][0]
-
-                insert_index = header_index + 1
-                while insert_index < len(lines) and not lines[insert_index].startswith("#"):
-                    insert_index += 1
-
-                lines.insert(insert_index, f"- {memory_sentence}")
-            else:
-                lines.append("\n# Memories")
-                lines.append(f"- {memory_sentence}")
-
-            write_vault_file(
-                self.agent.vault_root,
-                char_path.relative_to(self.agent.vault_root),
-                "\n".join(lines)
-            )
-
-            console.print(f"[bold green]Memory updated for {char_name}[/bold green]")
-
-        console.print("[bold cyan]Scene summary and character memories updated successfully.[/bold cyan]")
+        console.print("[bold green]Turn summaries updated.[/bold green]")
 
     def regenerate_last(self):
         # Grab the last messages exactly as stored
@@ -295,7 +261,10 @@ class GMInterface:
 
         while True:
             user_input = input(f"\n({self.current_submode}) {self.agent.character_names[self.agent.active_character_index]} GM> ").strip()
-            speaker_name = self.agent.character_names[self.agent.active_character_index]
+            scene_path = self.agent.get_active_scene_path()
+            scene_path = self.agent.get_active_scene_path()
+            ensure_current_turn(scene_path)
+            current_turn = ensure_current_turn(scene_path)
 
             # -----------------------------------------------------
             # 1) Handle TRY AGAIN and /p BEFORE any other commands
@@ -335,9 +304,15 @@ class GMInterface:
                     self.handle_roll(user_input[3:].strip())
                     continue
 
-                # Summarize scene
-                elif user_input == "/s":
-                    self.summarize_scene()
+                # Summarize scene, optionally with turns_to_keep
+                elif user_input.startswith("/s"):
+                    parts = user_input.split(maxsplit=1)
+                    turns_to_keep = None
+
+                    if len(parts) > 1 and parts[1].isdigit():
+                        turns_to_keep = int(parts[1])
+
+                    self.summarize_scene(turns_to_keep=turns_to_keep)
                     continue
 
 
@@ -349,6 +324,12 @@ class GMInterface:
                 # Next character
                 elif user_input == "/n":
                     self.next_character()
+                    continue
+
+                # Next turn
+                elif user_input == "/t":
+                    scene_path = self.agent.get_active_scene_path()
+                    advance_turn(scene_path, self.agent, current_turn=current_turn)
                     continue
 
                 # Submode shortcuts (/c, /r, /e)
@@ -393,10 +374,12 @@ class GMInterface:
 
     # ---------- Main ----------
 def main():
+    agent = OllamaAgent(vault, characters, scenes_active)
+    scene_text = agent.read_active_scene()
     # Create PromptManager
     pm = PromptManager(prompts_dir)
 
-    agent = OllamaAgent(vault, characters, scenes_active)
+    
 
     gm = GMInterface(
         agent=agent,

@@ -1,9 +1,7 @@
 from pathlib import Path
 from rich.console import Console
-from config import read_vault_file   # adjust import to your structure
 
 console = Console()
-
 
 class PromptManager:
     """
@@ -15,9 +13,10 @@ class PromptManager:
       - group prompt building
     """
 
-    def __init__(self, prompts_dir: Path):
+    def __init__(self, prompts_dir: Path, scene_text: str = ""):
         self.prompts_dir = prompts_dir
         self.cache = {}
+        self.scene_text = scene_text  # Scene text is passed in externally
 
     # ------------------------------------------------------------------
     # Internal cached loader
@@ -54,29 +53,6 @@ class PromptManager:
         return self._load(self.prompts_dir / filename)
 
     # ------------------------------------------------------------------
-    # GROUP SYSTEM PROMPT
-    # ------------------------------------------------------------------
-    def build_group_system_prompt(self, agent) -> str:
-        group_template_path = self.prompts_dir / "submode" / "group.md"
-        template = self._load(group_template_path)
-
-        # Build character sheet blocks
-        blocks = []
-        for name, path in zip(agent.character_names, agent.character_paths):
-            sheet_text = read_vault_file(agent.vault_root, str(path.relative_to(agent.vault_root)))
-            blocks.append(f"### CHARACTER: {name}\n{sheet_text}")
-
-        combined_sheets = "\n\n".join(blocks)
-        names = ", ".join(agent.character_names)
-
-        # Replace placeholders
-        return (
-            template
-            .replace("{{GROUP_NAMES}}", names)
-            .replace("{{CHARACTER_SHEETS}}", combined_sheets)
-        )
-
-    # ------------------------------------------------------------------
     # SUMMARY MESSAGES
     # ------------------------------------------------------------------
     def build_summary_messages(self, scene_text: str) -> list[dict]:
@@ -87,7 +63,20 @@ class PromptManager:
             "Do NOT continue the story or add new details. "
             "Do NOT use bullet lists."
         )
+        return [
+            {"role": "system", "content": self.summary_prompt()},
+            {"role": "user", "content": user_instruction},
+        ]
 
+    def build_turn_summary_messages(self, turn_text: str, turn_num: int) -> list[dict]:
+        user_instruction = (
+            f"Please write a short summary for Turn {turn_num}:\n"
+            f"{turn_text}\n\n"
+            "Write one sentence per character, mentioning key characters, actions, and events that occurred in this turn. "
+            "Do NOT continue the story beyond what is in this turn. "
+            "Do NOT add bullet lists or new information. "
+            "Focus on the outcomes of actions and the situation at the end rather than attempts."
+        )
         return [
             {"role": "system", "content": self.summary_prompt()},
             {"role": "user", "content": user_instruction},
@@ -98,17 +87,96 @@ class PromptManager:
     # ------------------------------------------------------------------
     def build_memory_messages(self, scene_text: str, char_name: str, char_sheet: str) -> list[dict]:
         system_block = self.summary_prompt() + "\n\n" + char_sheet
-
         user_instruction = (
             f"Based on this scene:\n{scene_text}\n\n"
             f"Write a single-sentence memory describing what the character '{char_name}' "
             f"will personally remember. Mention key events, people, and places."
         )
-
         return [
             {"role": "system", "content": system_block},
             {"role": "user", "content": user_instruction},
         ]
+
+    # ------------------------------------------------------------------
+    # SCENE TEXT BUILDER
+    # ------------------------------------------------------------------
+    def build_scene_text(self, scene_text: str, turns_to_keep: int = 3) -> str:
+        """
+        Builds a collapsed scene text for LLM input:
+        - Uses summaries if present (under '## Summary')
+        - Keeps the last `turns_to_keep` turns fully detailed
+        - Returns text suitable for LLM context
+        """
+        lines = scene_text.splitlines()
+        description_lines = []
+        turns = []  # list of dicts: {"summary": [], "lines": []}
+
+        current_summary_lines = []
+        current_turn_lines = []
+        in_description = False
+        in_turn = False
+        in_summary = False
+        in_full_turn = False
+
+        for line in lines:
+            stripped = line.strip()
+
+            if stripped.startswith("# Description"):
+                in_description = True
+                in_turn = in_summary = in_full_turn = False
+                continue
+            elif stripped.startswith("# Turn"):
+                # save previous turn
+                if current_summary_lines or current_turn_lines:
+                    turns.append({
+                        "summary": current_summary_lines if current_summary_lines else None,
+                        "lines": current_turn_lines
+                    })
+                current_summary_lines = []
+                current_turn_lines = []
+                in_description = False
+                in_turn = True
+                in_summary = False
+                in_full_turn = False
+                continue
+            elif stripped.startswith("## Summary"):
+                in_summary = True
+                in_full_turn = False
+                continue
+            elif stripped.startswith("## Full Turn"):
+                in_full_turn = True
+                in_summary = False
+                continue
+
+            if in_description:
+                description_lines.append(stripped)
+            elif in_summary:
+                current_summary_lines.append(stripped)
+            elif in_full_turn:
+                current_turn_lines.append(stripped)
+
+        # append the last turn
+        if current_summary_lines or current_turn_lines:
+            turns.append({
+                "summary": current_summary_lines if current_summary_lines else None,
+                "lines": current_turn_lines
+            })
+
+        # determine cutoff: last N turns to keep fully detailed
+        num_turns = len(turns)
+        cutoff_idx = max(0, num_turns - turns_to_keep)
+
+        # rebuild scene using summaries for older turns
+        final_lines = description_lines + [""] if description_lines else []
+
+        for idx, turn in enumerate(turns):
+            final_lines.append(f"# Turn {idx + 1}")
+            if idx < cutoff_idx and turn["summary"]:
+                final_lines.extend(turn["summary"])
+            else:
+                final_lines.extend(turn["lines"])
+
+        return "\n".join(final_lines)
 
     # ------------------------------------------------------------------
     # MAIN DIALOGUE MESSAGES
@@ -120,7 +188,7 @@ class PromptManager:
         submode_instructions: str,
         character_sheet: str,
         speaker_name: str,
-        scene_before_input: str,
+        shortened_scene: str,
         user_input: str,
     ) -> list[dict]:
         return [
@@ -130,20 +198,23 @@ class PromptManager:
             {"role": "system", "content": f"ACTIVE CHARACTER SHEET:\n{character_sheet}"},
             {"role": "user", "content": f"You are {speaker_name}. Respond only as this character."},
             {"role": "user", "content": (
-                f"Here is the scene so far:\n{scene_before_input}\n\n"
+                f"Here is the scene so far:\n{shortened_scene}\n\n"
                 f"The GM has said to you:\n{user_input}\nKeep your answer short unless the GM explicitly requests length."
             )}
         ]
 
-    def build_group_messages(self, system_prompt: str, group_prompt: str, scene_text: str, user_input: str) -> list[dict]:
-        """
-        Build the full message list for group submode.
-        """
+    def build_group_messages(
+        self,
+        system_prompt: str,
+        group_prompt: str,
+        shortened_scene: str,
+        user_input: str,
+    ) -> list[dict]:
         return [
             {"role": "system", "content": system_prompt},
             {"role": "system", "content": group_prompt},
             {"role": "user", "content": (
-                f"Here is the context you are in:\n{scene_text}\n\n"
+                f"Here is the context you are in:\n{shortened_scene}\n\n"
                 f"The GM has asked:\n{user_input}\n"
             )},
         ]
