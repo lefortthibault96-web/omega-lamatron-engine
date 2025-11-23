@@ -1,10 +1,12 @@
 @echo off
-REM Activate the Python virtual environment
-call "E:\Users\Tibo\Obsidian\PNJisme\PNJisme\LAMATRON\ttrpg_env\Scripts\activate.bat"
+REM Se placer dans le dossier du script
+cd /d "%~dp0"
+
+REM Activer le venv
+call ttrpg_env\Scripts\activate
 
 REM Run the TTRPG agent
-python "E:\Users\Tibo\Obsidian\PNJisme\PNJisme\LAMATRON\ollama_ttrpg_agent.py"
+py ollama_ttrpg_agent.py
 
 REM Pause so you can see any messages when it exits
 pause
-
