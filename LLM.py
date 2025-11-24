@@ -5,6 +5,7 @@ from rich.console import Console
 from config import DEFAULT_MODEL, safe_resolve, read_vault_file
 import tiktoken
 
+
 console = Console()
 # ---------- Agent ----------
 class OllamaAgent:
@@ -138,7 +139,6 @@ class OllamaAgent:
         Count tokens for a list of messages, optionally including assistant messages from history.
         Returns total tokens and breakdown per role.
         """
-        import tiktoken
 
         if model_to_use is None:
             model_to_use = self.model
@@ -171,3 +171,15 @@ class OllamaAgent:
         if return_breakdown:
             return total_tokens, breakdown
         return total_tokens
+    
+    def count_tokens_string(self, text: str, model_to_use: str = None) -> int:
+        if model_to_use is None:
+            model_to_use = self.model
+
+        try:
+            import tiktoken
+            encoding = tiktoken.encoding_for_model(model_to_use)
+        except KeyError:
+            encoding = tiktoken.get_encoding("cl100k_base")
+
+        return len(encoding.encode(text))

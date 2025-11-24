@@ -1,12 +1,12 @@
 @echo off
-REM Se placer dans le dossier du script
+REM Move to the folder containing this batch file
 cd /d "%~dp0"
 
-REM Activer le venv
+REM Activate the virtual environment
 call ttrpg_env\Scripts\activate
 
-REM Run the TTRPG agent
-py ollama_ttrpg_agent.py
+REM Run the TTRPG agent using the venv Python
+python ollama_ttrpg_agent.py
 
-REM Pause so you can see any messages when it exits
+REM Pause so you can see messages when it exits
 pause
