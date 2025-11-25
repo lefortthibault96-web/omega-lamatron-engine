@@ -7,27 +7,15 @@ from snitch import SnitchEditor, write_vault_file, run_snitch_auto_detection
 from dice import roll_dice
 from LLM import OllamaAgent
 from Prompt_Manager2000 import PromptManager
-from config import safe_resolve, read_vault_file, vault, characters, scenes_active, prompts_dir, HELP_LINES, SCENE_CONTEXT_THRESHOLD, DEFAULT_MODEL_TOKEN_LIMIT, DEFAULT_MODEL
+from config import safe_resolve, read_vault_file, vault_root, characters_dir, scenes_active_dir, prompts_dir, HELP_LINES, SCENE_CONTEXT_THRESHOLD, DEFAULT_MODEL_TOKEN_LIMIT
 from turns import ensure_current_turn, advance_turn, summarize_scene_turns
 from batch import BatchManager
 
 # ---------- Configuration ----------
 active_char = None
-user_input = ""
+GM_input = ""
 console = Console()
 
-# ---------- File helpers ----------
-def safe_resolve(vault_root: Path, relative_path: str) -> Path:
-    candidate = (vault_root / relative_path).resolve()
-    if not str(candidate).startswith(str(vault_root.resolve())):
-        raise ValueError("Illegal path escape attempt")
-    return candidate
-
-def read_vault_file(vault_root: Path, rel_path: str) -> str:
-    p = safe_resolve(vault_root, rel_path)
-    if not p.exists():
-        return ""
-    return p.read_text(encoding="utf-8")
 # ---------- Command Processing ----------
 class GMInterface:
     def __init__(self, agent: OllamaAgent, prompt_manager: PromptManager,
@@ -36,13 +24,14 @@ class GMInterface:
         self.agent = agent
         self.pm = prompt_manager
         self.current_submode = current_submode
-        self.submode_text = self.pm.submode(current_submode)
-        self.pm.scene_text = self.agent.read_active_scene()
+        self.submode_instruction_text = self.pm.submode(current_submode)
+        self.pm.scene_raw = self.agent.read_active_scene()
         # Cached base prompts
         self.SYSTEM_PROMPT = self.pm.system_prompt()
         self.CHARACTER_INSTRUCTIONS = self.pm.character_instructions()
         self.batcher = BatchManager(self.agent)
         self.retry_feedback = []
+        self.auto_mode = False
 
     # Existing methods like show_help, normalize_llm_output, list_characters, next_character, etc.
 
@@ -52,23 +41,22 @@ class GMInterface:
         Send GM input to the LLM, using a collapsed scene (summaries for old turns)
         instead of the full scene, append output to scene, store messages for retry.
         """
-
         # --- Append GM input first ---
         if user_input.strip():
             self.agent.append_to_active_scene(f"GM : {user_input}")
 
         # --- Build collapsed scene for LLM ---
-        shortened_scene = self.pm.build_scene_text(self.pm.scene_text)
+        collapsed_scene = self.pm.build_scene_text(turns_to_keep=None)
 
         speaker_name = self.agent.character_names[self.agent.active_character_index]
-        active_char_sheet = ""
+        active_char_sheet_text = ""
         # --- Build messages based on submode ---
         if self.current_submode == "group":
                 # New group messages builder handles scene and sheets internally
                 messages = self.pm.build_group_messages(
                     self.agent,
                     self.SYSTEM_PROMPT,
-                    shortened_scene,
+                    collapsed_scene,
                     user_input
                 )
                 speaker_name = "Group"
@@ -76,17 +64,17 @@ class GMInterface:
         else:
             # Single-character mode
             active_char_path = self.agent.character_paths[self.agent.active_character_index]
-            active_char_sheet = read_vault_file(
+            active_char_sheet_text = read_vault_file(
                 self.agent.vault_root,
                 str(active_char_path.relative_to(self.agent.vault_root))
             )
 
-            messages = self.pm.build_messages(
+            messages = self.pm.build_single_character_messages(
                 system_prompt=self.SYSTEM_PROMPT,
                 character_instructions=self.CHARACTER_INSTRUCTIONS,
-                submode_instructions=self.submode_text,
-                character_sheet=active_char_sheet,
-                scene_text=shortened_scene,  # <<< use collapsed scene
+                submode_instructions=self.submode_instruction_text,
+                character_sheet=active_char_sheet_text,
+                scene_text=collapsed_scene,  # <<< use collapsed scene
                 user_input=user_input,
                 speaker_name=speaker_name,
             )
@@ -106,10 +94,10 @@ class GMInterface:
         self.agent._retry_context = {
             "retry_system_prompt": self.SYSTEM_PROMPT,
             "retry_character_instructions": self.CHARACTER_INSTRUCTIONS,
-            "retry_submode_instructions": self.submode_text,
-            "retry_character_sheet": active_char_sheet,   # as you want
+            "retry_submode_instructions": self.submode_instruction_text,
+            "retry_character_sheet": active_char_sheet_text,   # as you want
             "retry_speaker_name": speaker_name,
-            "retry_original_scene_text": shortened_scene,  # correct for your workflow
+            "retry_scene_text_snapshot": collapsed_scene,  # correct for your workflow
             "retry_user_input": user_input,
 }
         # --- Call LLM ---
@@ -143,9 +131,9 @@ class GMInterface:
         # Build regex: match any starting substring of the full name followed by optional whitespace and colon
         # E.g., "Professor", "Professor Whizzlebum", "Whizzlebum"
         patterns = []
-        for i in range(len(name_parts)):
-            sub_name = " ".join(name_parts[i:])  # take suffixes
-            patterns.append(re.escape(sub_name))
+        for i in range(1, len(name_parts) + 1):
+            sub = " ".join(name_parts[:i])  # "Professor", then "Professor Whizzlebum"
+            patterns.append(re.escape(sub))
         pattern = rf"^(?:{'|'.join(patterns)})\s*:"
 
         # Remove the prefix if it exists
@@ -224,7 +212,7 @@ class GMInterface:
         submode_instructions   = ctx["retry_submode_instructions"]
         character_sheet        = ctx["retry_character_sheet"]
         speaker_name           = ctx["retry_speaker_name"]
-        shortened_scene        = ctx["retry_original_scene_text"]  # already collapsed
+        collapsed_scene        = ctx["retry_scene_text_snapshot"]  # already collapsed
         user_input             = ctx["retry_user_input"]
 
         # Roll back previous LLM output
@@ -245,19 +233,19 @@ class GMInterface:
             messages = self.pm.build_group_messages(
                     agent=self.agent,
                     system_prompt=system_prompt,
-                    scene_text=shortened_scene,   # already collapsed
+                    scene_text=collapsed_scene,   # already collapsed
                     user_input=user_input
                 )
             speaker_name = "Group"
         else:
             # Single-character method
-            messages = self.pm.build_messages(
+            messages = self.pm.build_single_character_messages(
                 system_prompt=system_prompt,
                 character_instructions=character_instructions,
                 submode_instructions=submode_instructions,
                 character_sheet=character_sheet,
                 speaker_name=speaker_name,
-                scene_text=shortened_scene,   # <-- already collapsed
+                scene_text=collapsed_scene,   # <-- already collapsed
                 user_input=user_input         # <-- now includes feedback
             )
 
@@ -314,17 +302,15 @@ class GMInterface:
         console.print("[bold cyan]GM Assistant Ready.[/bold cyan]\n")
 
         while True:
-            user_input = input(f"\n({self.current_submode}) {self.agent.character_names[self.agent.active_character_index]} GM> ").strip()
+            GM_input = input(f"\n({self.current_submode}) {self.agent.character_names[self.agent.active_character_index]} GM> ").strip()
             scene_path = self.agent.get_active_scene_path()
-            scene_path = self.agent.get_active_scene_path()
-            ensure_current_turn(scene_path)
             current_turn = ensure_current_turn(scene_path)
 
             # -----------------------------------------------------
             # 1) Handle TRY AGAIN and /p BEFORE any other commands
             # -----------------------------------------------------
-            if user_input.lower().startswith("try again") or user_input.startswith("/p"):
-                parts = user_input.split(" ", 1)
+            if GM_input.lower().startswith("try again") or GM_input.startswith("/p"):
+                parts = GM_input.split(" ", 1)
                 feedback = parts[1].strip() if len(parts) > 1 else ""
 
                 if feedback:
@@ -332,35 +318,35 @@ class GMInterface:
 
                 self.regenerate_last()
                 continue
-            # -----------------------------------------------------
-                # Narration-only append
-            if user_input.startswith("."):
-                narration_text = "GM : " + user_input[1:].lstrip()
+
+            # Narration-only append
+            if GM_input.startswith("."):
+                narration_text = "GM : " + GM_input[1:].lstrip()
                 self.agent.append_to_active_scene(narration_text)
                 console.print(f"[Narration appended]", style="bold cyan")
                 continue  # skip LLM response
 
-                   # ------------------ Toggle auto mode ------------------
-            if user_input == "*":
-                self.auto_mode = not getattr(self, "auto_mode", False)
+            # ------------------ Toggle auto mode ------------------
+            if GM_input == "*":
+                self.auto_mode = not self.auto_mode
                 status = "activated" if self.auto_mode else "deactivated"
                 console.print(f"[bold cyan]Auto mode {status}[/bold cyan]")
                 continue
 
-            if user_input.startswith("/"):
+            if GM_input.startswith("/"):
                 # Help
-                if user_input == "/h":
+                if GM_input == "/h":
                     self.show_help()
                     continue
 
                 # Roll dice
-                elif user_input.startswith("/r "):
-                    self.handle_roll(user_input[3:].strip())
+                elif GM_input.startswith("/r "):
+                    self.handle_roll(GM_input[3:].strip())
                     continue
 
                 # Summarize scene, optionally with turns_to_keep
-                elif user_input.startswith("/s"):
-                    parts = user_input.split(maxsplit=1)
+                elif GM_input.startswith("/s"):
+                    parts = GM_input.split(maxsplit=1)
                     turns_to_keep = None
 
                     if len(parts) > 1 and parts[1].isdigit():
@@ -371,46 +357,47 @@ class GMInterface:
 
 
                 # List characters
-                elif user_input == "/ls":
+                elif GM_input == "/ls":
                     self.list_characters()
                     continue
 
                 # Next character
-                elif user_input == "/n":
+                elif GM_input == "/n":
                     self.next_character()
                     continue
 
                 # Next turn
-                elif user_input == "/t":
+                elif GM_input == "/t":
                     scene_path = self.agent.get_active_scene_path()
                     advance_turn(scene_path, self.agent, current_turn=current_turn)
                     continue
 
                 # Submode shortcuts (/c, /r, /e)
-                elif user_input.lower() in ("/c", "/r", "/g", "/e"):
-                    if user_input.lower() == "/c":
+                elif GM_input.lower() in ("/c", "/r", "/g", "/e"):
+                    if GM_input.lower() == "/c":
                         self.current_submode = "combat"
-                    elif user_input.lower() == "/r":
+                    elif GM_input.lower() == "/r":
                         self.current_submode = "roleplay"
-                    elif user_input.lower() == "/g":
+                    elif GM_input.lower() == "/g":
                         self.current_submode = "group"
-                        self.submode_text = ""  # group mode manages its own system messages
+                        self.submode_instruction_text = ""
+                        console.print("[bold cyan]Submode switched to group[/bold cyan]")
                         continue
                     else:
                         self.current_submode = "exploration"
-                    self.submode_text = self.pm.submode(self.current_submode)
-                    console.print(f"[bold cyan]Submode switched to {self.current_submode}[/bold cyan]")
-                    continue
+                        self.submode_instruction_text = self.pm.submode(self.current_submode)
+                        console.print(f"[bold cyan]Submode switched to {self.current_submode}[/bold cyan]")
+                        continue
 
                 # Switch active character by number (/1 /2 /3)
-                elif user_input[1:].isdigit():
-                    self.switch_character(int(user_input[1:]))
+                elif GM_input.startswith("/") and GM_input[1:].isdigit():
+                    self.switch_character(int(GM_input[1:]))
                     continue
 
-                elif user_input == "/end":
+                elif GM_input == "/end":
 
                     # Get only the summary string (summarize_full_scene performs LLM calls)
-                    final_summary = self.summarize_full_scene(self.pm.scene_text)
+                    final_summary = self.summarize_full_scene(self.pm.scene_raw)
 
                     if not final_summary:
                         console.print("[yellow]No summary returned from summarizer.[/yellow]")
@@ -424,7 +411,7 @@ class GMInterface:
                     import re
                     # Remove any existing Scene Summary section(s)
                     cleaned = re.sub(
-                        r"(?ms)^\s*#{1,2}\s*Scene Summary\s*\n.*?(?=(?:^\s*#\s*Turn\s+1\b)|\Z)",
+                        r"(?ms)^\s*#{1,2}\s*Scene Summary\s*\n.*?(?=^\s*#\s*(Turn\s+\d+|Scene Summary)\b|\Z)",
                         "",
                         original
                     ).rstrip()
@@ -456,7 +443,7 @@ class GMInterface:
                         scene_path = self.agent.get_active_scene_path()
                         scene_path.write_text(new_scene, encoding="utf-8")
                         # Refresh pm.scene_text and agent internal state if needed
-                        self.pm.scene_text = new_scene
+                        self.pm.scene_raw = new_scene
                         console.print("\n[bold green]Full scene summary written into scene file.[/bold green]")
                         console.print("# Scene Summary\n" + final_summary.strip())
                     except Exception as e:
@@ -471,7 +458,7 @@ class GMInterface:
                     continue
 
             # Empty input → treat as "GM says nothing" and continue the scene
-            if not user_input:
+            if not GM_input:
                 if getattr(self, "auto_mode", False):
                     self.auto_next_character()   # switches character AND sends empty input
                 else:
@@ -482,11 +469,11 @@ class GMInterface:
                 # NORMAL FLOW: GM provides input → LLM responds → append to scene
 
             # Use the helper to send GM input to LLM and append
-            self._send_to_llm(user_input)
+            self._send_to_llm(GM_input)
 
     # ---------- Main ----------
 def main():
-    agent = OllamaAgent(vault, characters, scenes_active)
+    agent = OllamaAgent(vault_root, characters_dir, scenes_active_dir)
     scene_text = agent.read_active_scene()
     # Create PromptManager
     pm = PromptManager(prompts_dir)

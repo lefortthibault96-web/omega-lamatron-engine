@@ -25,7 +25,6 @@ class OllamaAgent:
 
         # NEW: Track last LLM output and GM input for retry
         self._last_llm_append = None
-        self._last_user_message_for_retry = None
 
         # Startup load printout
         console.print("[Character Loading]", style="bold cyan")
@@ -77,6 +76,7 @@ class OllamaAgent:
                 "offset": self._last_append["offset"],
                 "length": self._last_append["length"]
             }
+        self.scene_raw = self.read_active_scene()
         return True
 
     # --- NEW: Rollback last LLM output (uses stored file+offset)
@@ -90,7 +90,9 @@ class OllamaAgent:
         try:
             with open(file, "r+b") as f:
                 f.truncate(offset)
+            self.scene_raw = self.read_active_scene()
             self._last_llm_append = None
+            self._last_append = None   # optional but safer
             return True
         except Exception:
             return False
@@ -103,6 +105,7 @@ class OllamaAgent:
         try:
             with open(file, "r+b") as f:
                 f.truncate(offset)
+            self.scene_raw = self.read_active_scene()
             self._last_append = None
             return True
         except:

@@ -14,10 +14,10 @@ TURNS_TO_KEEP = 3               # How many last turns to leave unsummarized
 
 BASE_DIR = Path(__file__).resolve().parent
 # vault = Path(r"E:\\Users\\Tibo\\Obsidian\\PNJisme\\PNJisme\\Risus").resolve()
-vault = Path(__file__).resolve().parent
-characters = vault / "Characters" / "Active"
-scenes_active = vault / "Scenes" / "Active"
-prompts_dir = vault / "Prompts"
+vault_root = Path(__file__).resolve().parent
+characters_dir = vault_root / "Characters" / "Active"
+scenes_active_dir = vault_root / "Scenes" / "Active"
+prompts_dir = vault_root / "Prompts"
 
 HELP_LINES = [
     "/h                   - Show help",

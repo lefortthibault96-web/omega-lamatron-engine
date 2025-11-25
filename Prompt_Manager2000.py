@@ -1,7 +1,7 @@
 from pathlib import Path
 import re
 from rich.console import Console
-from config import read_vault_file
+from config import read_vault_file, vault_root, scenes_active_dir
 
 console = Console()
 
@@ -18,41 +18,62 @@ class PromptManager:
     def __init__(self, prompts_dir: Path, scene_text: str = ""):
         self.prompts_dir = prompts_dir
         self.cache = {}
-        self.scene_text = scene_text  # Scene text is passed in externally
+        self.vault_root = vault_root
+        self.scenes_active_dir = scenes_active_dir
 
     # ------------------------------------------------------------------
     # Internal cached loader
     # ------------------------------------------------------------------
-    def _load(self, path: Path) -> str:
-        if path in self.cache:
-            return self.cache[path]
+    def get_active_scene_file(self) -> Path | None:
+        """
+        Return the first active scene file in the active scenes directory.
+        """
+        md_files = sorted(self.scenes_active_dir.glob("*.md"))
+        return md_files[0] if md_files else None
 
-        if not path.exists():
-            console.print(f"[PromptManager] Missing prompt: {path}", style="bold yellow")
-            self.cache[path] = ""
+
+    def load_scene(self) -> str:
+        """
+        Always load the latest version of the active scene file.
+        """
+        active_scene = self.get_active_scene_file()
+        if not active_scene:
             return ""
+        rel_path = str(active_scene.relative_to(self.vault_root))
+        from config import read_vault_file
+        return read_vault_file(self.vault_root, rel_path)
 
-        text = path.read_text(encoding="utf-8").strip()
-        self.cache[path] = text
-        return text
 
-    # ------------------------------------------------------------------
-    # Base prompt getters
-    # ------------------------------------------------------------------
+# ------------------------------------------------------------------
+# Base prompt getters
+# ------------------------------------------------------------------
     def system_prompt(self) -> str:
-        return self._load(self.prompts_dir / "system.md")
+        return self.load(self.prompts_dir / "system.md")
+
 
     def character_instructions(self) -> str:
-        return self._load(self.prompts_dir / "character_instructions.md")
+        return self.load(self.prompts_dir / "character_instructions.md")
+
 
     def summary_prompt(self) -> str:
-        return self._load(self.prompts_dir / "summary_system.md")
+        return self.load(self.prompts_dir / "summary_system.md")
+
 
     def submode(self, mode: str) -> str:
-        return self._load(self.prompts_dir / "submode" / f"{mode}.md")
+        return self.load(self.prompts_dir / "submode" / f"{mode}.md")
 
-    def load(self, filename: str) -> str:
-        return self._load(self.prompts_dir / filename)
+    def load(self, path: Path) -> str:
+        """
+        Load a file from the given path with caching.
+        """
+        if path in self.cache:
+            return self.cache[path]
+        if not path.exists():
+            content = ""
+        else:
+            content = path.read_text(encoding="utf-8")
+        self.cache[path] = content
+        return content
     
 
     # ------------------------------------------------------------------
@@ -124,13 +145,17 @@ class PromptManager:
             {"role": "user", "content": user_instruction},
         ]
     
-    def build_scene_text(self, scene_text: str, turns_to_keep: int = 3) -> str:
+    def build_scene_text(self, turns_to_keep: int | None = None) -> str:
         """
         Builds a collapsed scene text for LLM input:
         - Uses summaries if present (under '## Summary')
         - Keeps the last `turns_to_keep` turns fully detailed
         - Returns text suitable for LLM context
         """
+        scene_text = self.load_scene()
+        if turns_to_keep is None:
+            from config import TURNS_TO_KEEP
+            turns_to_keep = TURNS_TO_KEEP
         lines = scene_text.splitlines()
         description_lines = []
         turns = []  # list of dicts: {"summary": [], "lines": []}
@@ -182,14 +207,7 @@ class PromptManager:
                 current_summary_lines.append(stripped)
 
             elif in_full_turn or in_turn:
-                # 🔥 KEY FIX: keep content even without subheaders
-                current_turn_lines.append(stripped)
-
-            if in_description:
-                description_lines.append(stripped)
-            elif in_summary:
-                current_summary_lines.append(stripped)
-            elif in_full_turn:
+                # KEY FIX: keep content even without subheaders
                 current_turn_lines.append(stripped)
 
         # append the last turn
@@ -218,7 +236,7 @@ class PromptManager:
     # ------------------------------------------------------------------
     # MAIN DIALOGUE MESSAGES
     # ------------------------------------------------------------------
-    def build_messages(
+    def build_single_character_messages(
         self,
         system_prompt: str,
         character_instructions: str,
@@ -234,9 +252,8 @@ class PromptManager:
             {"role": "system", "content": submode_instructions},
             {"role": "system", "content": f"ACTIVE CHARACTER SHEET:\n{character_sheet}"},
             {"role": "user", "content": (
-                f"You are {speaker_name}. Respond only as this character."
                 f"Here is the scene so far:\n{scene_text}\n\n"
-                f"The GM has said to you:\n{user_input}\nKeep your answer short unless the GM explicitly requests length."
+                f"You are {speaker_name}. Respond only as this character. The GM has said to you:\n{user_input}\nKeep your answer short unless the GM explicitly requests length."
             )}
         ]
 
@@ -255,7 +272,7 @@ class PromptManager:
 
         # Load group prompt template from file
         group_template_path = self.prompts_dir / "submode" / "group.md"
-        template = self._load(group_template_path)  # assuming self._load reads file text
+        template = self.load(group_template_path)  # assuming self.load reads file text
 
         # Build character sheets text
         sheet_blocks = []
