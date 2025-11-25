@@ -1,7 +1,9 @@
 import re
-from config import TURNS_TO_KEEP, AUTO_SUMMARIZE, DEFAULT_MODEL_TOKEN_LIMIT, CONTEXT_THRESHOLD, prompts_dir
+from config import AUTO_SUMMARIZE, CONTEXT_THRESHOLD, prompts_dir
 from rich.console import Console
 from pathlib import Path
+from config import TURNS_TO_KEEP
+from utils import DEFAULT_MODEL_TOKEN_LIMIT
 
 console = Console()
 
@@ -28,6 +30,22 @@ def ensure_current_turn(scene_path):
         description_content = lines[:first_turn_index]
         remaining = lines[first_turn_index:]
         lines = ["# Description", ""] + description_content + [""] + remaining
+    
+    # --- Ensure at least one turn exists ---
+    turn_numbers = [int(m.group(1)) for l in lines if (m := turn_pattern.match(l))]
+    if not turn_numbers:
+        console.print("[cyan]No turns found — creating # Turn 1…[/cyan]")
+
+        # Insert Turn 1 after description block
+        desc_index = next(
+            (i for i, line in enumerate(lines) if line.strip().lower().startswith("# description")),
+            -1
+        )
+        insert_index = desc_index + 1
+        while insert_index < len(lines) and not lines[insert_index].strip().startswith("#"):
+            insert_index += 1
+
+        lines = lines[:insert_index] + ["", "# Turn 1", ""] + lines[insert_index:]
 
     # --- Determine last turn ---
     turn_numbers = [int(turn_pattern.match(l).group(1)) for l in lines if turn_pattern.match(l)]
@@ -88,15 +106,76 @@ def summarize_turn(turn_text, agent, turn_num):
     summary = agent.chat(summary_messages).strip()
     return summary
 
-turn_header_pattern = re.compile(r"^#\s*Turn\s+(\d+)", re.I)
-summary_header = "## Summary:"
 
+turn_header_pattern = re.compile(
+    r"^#{1,3}\s*Turn[: ]+\s*(\d+)",
+    re.IGNORECASE
+)
+
+
+
+# =====================================================================
+#   RE-NUMBER ALL TURNS AFTER SUMMARIZATION + REMOVALS
+# =====================================================================
+def renumber_turns(scene_path: Path):
+    lines = scene_path.read_text(encoding="utf-8").splitlines()
+
+    new_lines = []
+    new_turn_num = 1
+
+    for line in lines:
+        m = turn_header_pattern.match(line)
+        if m:
+            # Replace turn header with new consecutive number
+            new_lines.append(f"# Turn {new_turn_num}")
+            new_turn_num += 1
+        else:
+            new_lines.append(line)
+
+    scene_path.write_text("\n".join(new_lines), encoding="utf-8")
+    return new_turn_num - 1  # number of turns
+
+
+
+# =====================================================================
+#   REMOVE EMPTY TURNS
+# =====================================================================
+def remove_empty_turns(lines, console):
+    turn_positions = [(i, int(m.group(1))) for i, line in enumerate(lines) if (m := turn_header_pattern.match(line))]
+    to_delete_ranges = []
+
+    for idx, (line_idx, turn_num) in enumerate(turn_positions):
+        next_idx = turn_positions[idx + 1][0] if idx + 1 < len(turn_positions) else len(lines)
+        block = lines[line_idx:next_idx]
+
+        # Remove all headers
+        content_lines = [
+            l for l in block
+            if not l.strip().lower().startswith("# turn")
+            and not l.strip().lower().startswith("## summary")
+            and not l.strip().lower().startswith("## full")
+        ]
+
+        # If block contains no actual content → mark for removal
+        if all(not l.strip() for l in content_lines):
+            console.print(f"[yellow]Removed empty Turn {turn_num}[/yellow]")
+            to_delete_ranges.append((line_idx, next_idx))
+
+    # Apply deletions in reverse order (so indexing stays valid)
+    for start, end in reversed(to_delete_ranges):
+        del lines[start:end]
+
+    return lines
+
+
+
+# =====================================================================
+#   MAIN SUMMARIZATION FUNCTION
+# =====================================================================
 def summarize_scene_turns(scene_path: Path, agent, turns_to_keep: int = None):
-    from rich.console import Console
-    from config import TURNS_TO_KEEP
-    import re
 
     console = Console()
+    summary_marker = "## Summary"
 
     if not scene_path or not scene_path.exists():
         console.print("[red]Scene file not found.[/red]")
@@ -105,15 +184,20 @@ def summarize_scene_turns(scene_path: Path, agent, turns_to_keep: int = None):
     if turns_to_keep is None:
         turns_to_keep = TURNS_TO_KEEP
 
-    turn_pattern = re.compile(r"^#\s*Turn\s+(\d+)", re.I)
-    summary_marker = "## Summary"
-
     console.print("\n[cyan]Starting turn summarization…[/cyan]\n")
 
     while True:
         lines = scene_path.read_text(encoding="utf-8").splitlines()
-        # Find all turns
-        turn_positions = [(i, int(m.group(1))) for i, line in enumerate(lines) if (m := turn_pattern.match(line))]
+
+        # ------------------------
+        # Remove empty turns first
+        # ------------------------
+        lines = remove_empty_turns(lines, console)
+        scene_path.write_text("\n".join(lines), encoding="utf-8")
+
+        # Re-scan after removal
+        lines = scene_path.read_text(encoding="utf-8").splitlines()
+        turn_positions = [(i, int(m.group(1))) for i, line in enumerate(lines) if (m := turn_header_pattern.match(line))]
 
         if not turn_positions:
             console.print("[yellow]No turns found to summarize.[/yellow]")
@@ -125,27 +209,38 @@ def summarize_scene_turns(scene_path: Path, agent, turns_to_keep: int = None):
         else:
             turns_to_summarize = turn_positions[:-turns_to_keep]
 
-        # Find the first unsummarized turn
+        # Find the first turn without a Summary section
         next_turn = None
         for idx, (line_idx, turn_num) in enumerate(turns_to_summarize):
-            # Find end of turn
             next_idx = turn_positions[idx + 1][0] if idx + 1 < len(turn_positions) else len(lines)
-            turn_block = lines[line_idx:next_idx]
-            turn_text = "\n".join(turn_block)
+            block = lines[line_idx:next_idx]
+            block_text = "\n".join(block)
 
-            if summary_marker not in turn_text:
-                next_turn = (line_idx, turn_num, next_idx, turn_block)
-                break
+            if summary_marker in block_text:
+                continue  # already summarized
 
-        if not next_turn:
-            # No more turns to summarize
+            # Skip empty ones (already removed above, but double safety)
+            non_header = [
+                l for l in block
+                if not l.strip().lower().startswith("# turn")
+                and not l.strip().lower().startswith("## summary")
+                and not l.strip().lower().startswith("## full")
+            ]
+            if all(not l.strip() for l in non_header):
+                console.print(f"[yellow]Skipped empty Turn {turn_num}[/yellow]")
+                continue
+
+            next_turn = (line_idx, turn_num, next_idx, block)
             break
 
-        line_idx, turn_num, next_idx, turn_block = next_turn
+        if not next_turn:
+            break  # no more to summarize
+
+        line_idx, turn_num, next_idx, block = next_turn
 
         console.print(f"[cyan]→ Turn {turn_num}: generating summary…[/cyan]")
 
-        summary = summarize_turn("\n".join(turn_block), agent, turn_num).strip()
+        summary = summarize_turn("\n".join(block), agent, turn_num).strip()
 
         new_block = [
             f"# Turn {turn_num}",
@@ -153,15 +248,20 @@ def summarize_scene_turns(scene_path: Path, agent, turns_to_keep: int = None):
             summary,
             "",
             "## Full Turn",
-        ] + turn_block[1:]  # preserve original lines except header
+        ] + block[1:]
 
-        # Insert summary immediately
         lines[line_idx:next_idx] = new_block
         scene_path.write_text("\n".join(lines), encoding="utf-8")
 
         console.print(f"[green]✓ Turn {turn_num} summarized.[/green]\n")
 
-    console.print("[bold green]All missing turn summaries completed.[/bold green]\n")
+    console.print("[bold green]All missing turn summaries completed.[/bold green]")
+
+    # ----------------------------------------------------
+    # FINAL STEP → Renumber all turns to be consecutive
+    # ----------------------------------------------------
+    final_count = renumber_turns(scene_path)
+    console.print(f"[cyan]Turns renumbered 1 → {final_count}[/cyan]\n")
 
 def parse_scene_generic(self, scene_text: str) -> list[dict]:
     """

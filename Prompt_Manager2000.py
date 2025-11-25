@@ -1,7 +1,7 @@
 from pathlib import Path
-import re
 from rich.console import Console
-from config import read_vault_file, vault_root, scenes_active_dir
+from config import vault_root, scenes_active_dir
+from utils import read_vault_file
 
 console = Console()
 
@@ -40,7 +40,6 @@ class PromptManager:
         if not active_scene:
             return ""
         rel_path = str(active_scene.relative_to(self.vault_root))
-        from config import read_vault_file
         return read_vault_file(self.vault_root, rel_path)
 
 

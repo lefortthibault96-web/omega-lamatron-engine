@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 import re
 from pathlib import Path
-import msvcrt
 from rich.console import Console
 from snitch import SnitchEditor, write_vault_file, run_snitch_auto_detection
 from dice import roll_dice
 from LLM import OllamaAgent
 from Prompt_Manager2000 import PromptManager
-from config import safe_resolve, read_vault_file, vault_root, characters_dir, scenes_active_dir, prompts_dir, HELP_LINES, SCENE_CONTEXT_THRESHOLD, DEFAULT_MODEL_TOKEN_LIMIT
+from config import vault_root, characters_dir, scenes_active_dir, prompts_dir, HELP_LINES, SCENE_CONTEXT_THRESHOLD
 from turns import ensure_current_turn, advance_turn, summarize_scene_turns
 from batch import BatchManager
+from utils import read_vault_file, DEFAULT_MODEL_TOKEN_LIMIT, check_context_usage
 
 # ---------- Configuration ----------
 active_char = None
@@ -87,7 +87,6 @@ class GMInterface:
         self.agent._last_token_usage = tokens_used
 
         # --- Check against model limit ---
-        from config import DEFAULT_MODEL_TOKEN_LIMIT, check_context_usage
         check_context_usage(tokens_used, DEFAULT_MODEL_TOKEN_LIMIT)
 
         # --- Store for retry ---
