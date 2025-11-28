@@ -6,10 +6,11 @@ from snitch import SnitchEditor, write_vault_file, run_snitch_auto_detection
 from dice import roll_dice
 from LLM import OllamaAgent
 from Prompt_Manager2000 import PromptManager
-from config import vault_root, characters_dir, scenes_active_dir, prompts_dir, HELP_LINES, SCENE_CONTEXT_THRESHOLD
-from turns import ensure_current_turn, advance_turn, summarize_scene_turns
+from config import vault_root, characters_dir, scenes_active_dir, prompts_dir, HELP_LINES, DYNAMIC_SUMMARY_ALLOW_MIDTURN
+from turns import ensure_current_turn, advance_turn, summarize_scene_turns, summarize_turn_fulltext_batches, renumber_turns, dynamic_summarize_scene
 from batch import BatchManager
-from utils import read_vault_file, DEFAULT_MODEL_TOKEN_LIMIT, check_context_usage
+from utils import read_vault_file, DEFAULT_MODEL_TOKEN_LIMIT, check_context_usage, remove_empty_turns
+from commands import build_default_registry, CommandParser
 
 # ---------- Configuration ----------
 active_char = None
@@ -19,13 +20,12 @@ console = Console()
 # ---------- Command Processing ----------
 class GMInterface:
     def __init__(self, agent: OllamaAgent, prompt_manager: PromptManager,
-                current_submode: str = "roleplay"):
-        
+                 current_submode: str = "roleplay"):
+
         self.agent = agent
         self.pm = prompt_manager
         self.current_submode = current_submode
         self.submode_instruction_text = self.pm.submode(current_submode)
-        self.pm.scene_raw = self.agent.read_active_scene()
         # Cached base prompts
         self.SYSTEM_PROMPT = self.pm.system_prompt()
         self.CHARACTER_INSTRUCTIONS = self.pm.character_instructions()
@@ -33,36 +33,51 @@ class GMInterface:
         self.retry_feedback = []
         self.auto_mode = False
 
-    # Existing methods like show_help, normalize_llm_output, list_characters, next_character, etc.
+        # Expose console on the instance so commands.py can use gm.console
+        self.console = console
 
-    # ------------------- NEW HELPER -------------------
+        # Command system
+        self.registry = build_default_registry()
+        self.parser = CommandParser(self.registry)
+
+    # ------------------- CORE LLM HELPER -------------------
     def _send_to_llm(self, user_input: str):
         """
-        Send GM input to the LLM, using a collapsed scene (summaries for old turns)
+        Send GM input to the LLM, using a dynamically collapsed scene (summaries for old turns)
         instead of the full scene, append output to scene, store messages for retry.
         """
+
         # --- Append GM input first ---
         if user_input.strip():
             self.agent.append_to_active_scene(f"GM : {user_input}")
 
-        # --- Build collapsed scene for LLM ---
-        collapsed_scene = self.pm.build_scene_text(turns_to_keep=None)
+        # ======================================================
+        # Build dynamically summarized scene for LLM
+        # ======================================================
+        candidate_text, included_summaries, included_fulls = dynamic_summarize_scene(
+            pm=self.pm,
+            batcher=self.batcher,
+            agent=self.agent,
+            allow_fulltext_collapse=None   # obey config flag
+        )
+
+        collapsed_scene = candidate_text
 
         speaker_name = self.agent.character_names[self.agent.active_character_index]
         active_char_sheet_text = ""
+
         # --- Build messages based on submode ---
         if self.current_submode == "group":
-                # New group messages builder handles scene and sheets internally
-                messages = self.pm.build_group_messages(
-                    self.agent,
-                    self.SYSTEM_PROMPT,
-                    collapsed_scene,
-                    user_input
-                )
-                speaker_name = "Group"
+
+            messages = self.pm.build_group_messages(
+                self.agent,
+                self.SYSTEM_PROMPT,
+                collapsed_scene,
+                user_input
+            )
+            speaker_name = "Group"
 
         else:
-            # Single-character mode
             active_char_path = self.agent.character_paths[self.agent.active_character_index]
             active_char_sheet_text = read_vault_file(
                 self.agent.vault_root,
@@ -74,7 +89,7 @@ class GMInterface:
                 character_instructions=self.CHARACTER_INSTRUCTIONS,
                 submode_instructions=self.submode_instruction_text,
                 character_sheet=active_char_sheet_text,
-                scene_text=collapsed_scene,  # <<< use collapsed scene
+                scene_text=collapsed_scene,
                 user_input=user_input,
                 speaker_name=speaker_name,
             )
@@ -86,7 +101,7 @@ class GMInterface:
         console.print(f"[Token Usage] {tokens_used} tokens: {breakdown}")
         self.agent._last_token_usage = tokens_used
 
-        # --- Check against model limit ---
+        # --- Check context limit ---
         check_context_usage(tokens_used, DEFAULT_MODEL_TOKEN_LIMIT)
 
         # --- Store for retry ---
@@ -94,11 +109,12 @@ class GMInterface:
             "retry_system_prompt": self.SYSTEM_PROMPT,
             "retry_character_instructions": self.CHARACTER_INSTRUCTIONS,
             "retry_submode_instructions": self.submode_instruction_text,
-            "retry_character_sheet": active_char_sheet_text,   # as you want
+            "retry_character_sheet": active_char_sheet_text,
             "retry_speaker_name": speaker_name,
-            "retry_scene_text_snapshot": collapsed_scene,  # correct for your workflow
+            "retry_scene_text_snapshot": collapsed_scene,
             "retry_user_input": user_input,
-}
+        }
+
         # --- Call LLM ---
         response = self.agent.chat(messages)
 
@@ -106,8 +122,6 @@ class GMInterface:
         char_response = self.normalize_llm_output(response, speaker_name)
         console.print(char_response)
         self.agent.append_llm_output(char_response)
-
-
 
     # ------------------- AUTO NEXT -------------------
     def auto_next_character(self):
@@ -128,10 +142,9 @@ class GMInterface:
         # Split the speaker name into words
         name_parts = speaker_name.split()
         # Build regex: match any starting substring of the full name followed by optional whitespace and colon
-        # E.g., "Professor", "Professor Whizzlebum", "Whizzlebum"
         patterns = []
         for i in range(1, len(name_parts) + 1):
-            sub = " ".join(name_parts[:i])  # "Professor", then "Professor Whizzlebum"
+            sub = " ".join(name_parts[:i])
             patterns.append(re.escape(sub))
         pattern = rf"^(?:{'|'.join(patterns)})\s*:"
 
@@ -141,9 +154,7 @@ class GMInterface:
         # Prepend canonical speaker
         return f"{speaker_name} : {response}"
 
-
-
-    # --- NEW: list characters
+    # --- Character helpers ---
     def list_characters(self):
         console.print("\n[bold cyan]Characters:[/bold cyan]")
         for i, name in enumerate(self.agent.character_names):
@@ -151,7 +162,6 @@ class GMInterface:
             console.print(f"{i+1}. {name} {marker}")
         console.print("")
 
-    # --- NEW: switch active character by index
     def switch_character(self, idx: int):
         if 1 <= idx <= len(self.agent.character_names):
             self.agent.active_character_index = idx - 1
@@ -159,7 +169,6 @@ class GMInterface:
         else:
             console.print("[red]Invalid character index[/red]")
 
-    # --- NEW: next character with wraparound
     def next_character(self):
         if not self.agent.character_names:
             console.print("[red]No characters to switch[/red]")
@@ -176,304 +185,232 @@ class GMInterface:
             if "breakdown" in result:
                 console.print(f"Breakdown: {result['breakdown']}")
             console.print(f"Total: [bold yellow]{result['total']}[/bold yellow]")
-        except:
+        except Exception:
             console.print("[red]Invalid dice expression[/red]")
 
-
-    def summarize_scene(self, turns_to_keep: int = None):
-        """
-        Manual trigger for auto-summarizing old turns.
-        Optional: specify number of recent turns to keep unsummarized.
-        """
-        abs_scene_path = self.agent.get_active_scene_path()
-
-        if not abs_scene_path or not abs_scene_path.exists():
-            console.print("[red]No active scene file to summarize.[/red]")
-            return
-
-        console.print("[cyan]Manually summarizing old turns…[/cyan]")
-
-        # Trigger the turn-by-turn summarizer
-        summarize_scene_turns(abs_scene_path, self.agent, turns_to_keep=turns_to_keep)
-
-        console.print("[bold green]Turn summaries updated.[/bold green]")
-
+    # --- Regenerate last LLM response ---
     def regenerate_last(self):
-        # Retrieve the parameters used to create the last message batch
         ctx = getattr(self.agent, "_retry_context", None)
         if not ctx:
             console.print("[yellow]Nothing to retry.[/yellow]")
             return
 
-        # Unpack stored values (already shortened)
         system_prompt          = ctx["retry_system_prompt"]
         character_instructions = ctx["retry_character_instructions"]
         submode_instructions   = ctx["retry_submode_instructions"]
         character_sheet        = ctx["retry_character_sheet"]
         speaker_name           = ctx["retry_speaker_name"]
-        collapsed_scene        = ctx["retry_scene_text_snapshot"]  # already collapsed
+        collapsed_scene        = ctx["retry_scene_text_snapshot"]
         user_input             = ctx["retry_user_input"]
 
-        # Roll back previous LLM output
         rolled = self.agent.rollback_last_llm_output()
         if not rolled:
             console.print("[yellow]No previous LLM output to roll back.[/yellow]")
 
-        # ---- Inject retry feedback BEFORE rebuilding messages ----
+        # Inject retry feedback
         if self.retry_feedback:
             feedback = "\n".join(self.retry_feedback)
             user_input = user_input + "\n" + feedback
-            ctx["retry_user_input"] = user_input  # update stored version
+            ctx["retry_user_input"] = user_input
 
-        # ---- Rebuild message stack ----
-    # ---- Rebuild message stack depending on mode ----
+        # Rebuild message stack
         if self.current_submode == "group":
-            # Use group method
             messages = self.pm.build_group_messages(
-                    agent=self.agent,
-                    system_prompt=system_prompt,
-                    scene_text=collapsed_scene,   # already collapsed
-                    user_input=user_input
-                )
+                agent=self.agent,
+                system_prompt=system_prompt,
+                scene_text=collapsed_scene,
+                user_input=user_input
+            )
             speaker_name = "Group"
         else:
-            # Single-character method
             messages = self.pm.build_single_character_messages(
                 system_prompt=system_prompt,
                 character_instructions=character_instructions,
                 submode_instructions=submode_instructions,
                 character_sheet=character_sheet,
                 speaker_name=speaker_name,
-                scene_text=collapsed_scene,   # <-- already collapsed
-                user_input=user_input         # <-- now includes feedback
+                scene_text=collapsed_scene,
+                user_input=user_input
             )
 
         console.print("[cyan]Regenerating last LLM response…[/cyan]")
         response = self.agent.chat(messages)
 
-        # ---- Normalize and append to scene ----
         speaker_name = self.agent.character_names[self.agent.active_character_index]
         char_response = self.normalize_llm_output(response, speaker_name)
         self.agent.append_llm_output(char_response)
 
-        # ---- Print updated output ----
         console.print("\n[bold green]Updated Response:[/bold green]")
         console.print(char_response + "\n")
 
-    def summarize_full_scene(self, scene_text: str) -> str:
-        console.print("[cyan]Summarizing full scene…[/cyan]")
+    # ============================================================
+    # COMMAND HANDLERS (used by commands.py)
+    # ============================================================
 
-        summary_batches = self.batcher.get_tokenwise_summary_batches(
-            scene_text=scene_text,
-            system_prompts=[{"role": "system", "content": self.pm.summary_prompt()}],
-            SCENE_CONTEXT_THRESHOLD=SCENE_CONTEXT_THRESHOLD,
-            prompt_manager=self.pm,
-            model_token_limit=DEFAULT_MODEL_TOKEN_LIMIT,
+    def cmd_force_summarize(self, arg: str):
+        """
+        Force a dynamic summarization pass.
+        Optional arg = number of full turns to keep (currently informational).
+        """
+        scene_path = self.agent.get_active_scene_path()
+        scene_text = self.agent.read_active_scene()
+
+        # 1. Remove empty turns
+        lines = scene_text.splitlines()
+        lines = remove_empty_turns(lines)
+        scene_text = "\n".join(lines).strip() + "\n"
+        scene_path.write_text(scene_text, encoding="utf-8")
+
+        # 2. Renumber
+        renumber_turns(scene_path)
+
+        # 3. Summarize old turns
+        summarize_scene_turns(self.agent, None)
+
+        # 4. Optional info about turns_to_keep
+        if arg.isdigit():
+            turns_to_keep = int(arg)
+            console.print(f"[cyan]Forcing collapse while keeping last {turns_to_keep} turns (config-dependent).[/cyan]")
+        else:
+            console.print("[cyan]Forcing collapse (mid-turn allowed)…[/cyan]")
+
+        # 5. Hard collapse pass
+        summarize_turn_fulltext_batches(
+            self.pm,
+            self.batcher,
+            self.agent,
+            scene_text=self.agent.read_active_scene(),
+            max_batches=1,
+            mode="dynamic"
         )
 
-        accumulated_summary = ""
-        total = len(summary_batches)
-        console.print(f"[cyan]Created {total} summarization batch(es).[/cyan]")
+        # 6. Rebuild dynamic batch with full collapse allowed
+        candidate_text, included_summaries, included_fulls = dynamic_summarize_scene(
+            pm=self.pm,
+            batcher=self.batcher,
+            agent=self.agent,
+            allow_fulltext_collapse=True
+        )
 
-        for i, batch in enumerate(summary_batches, start=1):
-            messages = self.pm.build_summary_messages(
-                scene_text=batch['batch_text'],
-                prior_summary_text=batch['prior_summary_text']  # empty for first batch
-            )
+        console.print("[green]Scene collapsed.[/green]")
+        console.print(
+            f"[cyan]Dynamic batch includes: "
+            f"{len(included_summaries)} summaries, "
+            f"{len(included_fulls)} full turns.[/cyan]"
+        )
 
-            used_tokens = self.agent.count_tokens(messages)
-            console.print(f"\n[bold cyan]Processing batch {i}/{total}…[/bold cyan]")
-            console.print(f"[magenta]Batch {i} token usage: {used_tokens} tokens[/magenta]")
-            console.print(f"[magenta]Turns in this batch: {batch['turn_indices']}[/magenta]")
-            console.print(f"[yellow]Requesting LLM summary for batch {i}…[/yellow]")
+    def cmd_next_turn(self):
+        scene_path = self.agent.get_active_scene_path()
+        scene_text = self.agent.read_active_scene()
 
-            llm_output = self.agent.chat(messages).strip()
-            console.print(f"[green]Received summary for batch {i}.[/green]")
+        # 1. Remove empty shells
+        lines = remove_empty_turns(scene_text.splitlines())
+        scene_text = "\n".join(lines).strip() + "\n"
+        scene_path.write_text(scene_text, encoding="utf-8")
 
-            accumulated_summary += ("\n\n" if accumulated_summary else "") + llm_output
-            batch["prior_summary_text"] = accumulated_summary
+        # 2. Renumber sequentially
+        renumber_turns(scene_path)
 
-        console.print("\n[bold green]All batches processed![/bold green]")
-        return accumulated_summary.strip()
-    
+        # 3. Summarize old turns
+        summarize_scene_turns(self.agent, None)
+
+        # 4. Determine current turn
+        current_turn = ensure_current_turn(scene_path)
+
+        # 5. Open NEW turn as "(In Progress)"
+        advance_turn(scene_path, self.agent, current_turn=current_turn)
+
+        # 6. Dynamic summarization after advancing
+        candidate_text, included_summaries, included_fulls = dynamic_summarize_scene(
+            pm=self.pm,
+            batcher=self.batcher,
+            agent=self.agent,
+            allow_fulltext_collapse=True
+        )
+
+        console.print(
+            f"[cyan]Dynamic batch built after advancing from Turn {current_turn}:[/cyan]"
+        )
+        console.print(
+            f"[cyan]{len(included_summaries)} summaries, {len(included_fulls)} full turns included.[/cyan]"
+        )
+
+    def cmd_end_scene(self):
+        scene_path = self.agent.get_active_scene_path()
+        scene_text = self.agent.read_active_scene()
+
+        # 1. Close any (In Progress) turn if your agent supports it
+        if hasattr(self.agent, "close_turn_in_progress"):
+            self.agent.close_turn_in_progress()
+            scene_text = self.agent.read_active_scene()
+
+        # 2. Remove empty turns
+        lines = remove_empty_turns(scene_text.splitlines())
+        scene_text = "\n".join(lines).strip() + "\n"
+        scene_path.write_text(scene_text, encoding="utf-8")
+
+        # 3. Renumber
+        renumber_turns(scene_path)
+
+        # 4. Full-scene collapse (mode="end" collapses all remaining turns)
+        summarize_turn_fulltext_batches(
+            self.pm,
+            self.batcher,
+            self.agent,
+            scene_text=self.agent.read_active_scene(),
+            mode="end"
+        )
+
+        console.print("\n[bold green]Full scene summary written into scene file.[/bold green]")
+
     # ---------- MAIN INTERACTIVE LOOP ----------
     def run(self):
         console.print("[bold cyan]GM Assistant Ready.[/bold cyan]\n")
 
         while True:
-            GM_input = input(f"\n({self.current_submode}) {self.agent.character_names[self.agent.active_character_index]} GM> ").strip()
+            GM_input = input(
+                f"\n({self.current_submode}) "
+                f"{self.agent.character_names[self.agent.active_character_index]} GM> "
+            ).strip()
+
             scene_path = self.agent.get_active_scene_path()
             current_turn = ensure_current_turn(scene_path)
 
-            # -----------------------------------------------------
-            # 1) Handle TRY AGAIN and /p BEFORE any other commands
-            # -----------------------------------------------------
-            if GM_input.lower().startswith("try again") or GM_input.startswith("/p"):
-                parts = GM_input.split(" ", 1)
-                feedback = parts[1].strip() if len(parts) > 1 else ""
-
-                if feedback:
-                    self.retry_feedback.append(feedback)
-
-                self.regenerate_last()
-                continue
-
-            # Narration-only append
+            # --------------------------------------------------------
+            # 0) Narration-only append (starts with ".")
+            # --------------------------------------------------------
             if GM_input.startswith("."):
                 narration_text = "GM : " + GM_input[1:].lstrip()
                 self.agent.append_to_active_scene(narration_text)
-                console.print(f"[Narration appended]", style="bold cyan")
-                continue  # skip LLM response
-
-            # ------------------ Toggle auto mode ------------------
-            if GM_input == "*":
-                self.auto_mode = not self.auto_mode
-                status = "activated" if self.auto_mode else "deactivated"
-                console.print(f"[bold cyan]Auto mode {status}[/bold cyan]")
+                console.print("[Narration appended]", style="bold cyan")
                 continue
 
-            if GM_input.startswith("/"):
-                # Help
-                if GM_input == "/h":
-                    self.show_help()
-                    continue
-
-                # Roll dice
-                elif GM_input.startswith("/r "):
-                    self.handle_roll(GM_input[3:].strip())
-                    continue
-
-                # Summarize scene, optionally with turns_to_keep
-                elif GM_input.startswith("/s"):
-                    parts = GM_input.split(maxsplit=1)
-                    turns_to_keep = None
-
-                    if len(parts) > 1 and parts[1].isdigit():
-                        turns_to_keep = int(parts[1])
-
-                    self.summarize_scene(turns_to_keep=turns_to_keep)
-                    continue
-
-
-                # List characters
-                elif GM_input == "/ls":
-                    self.list_characters()
-                    continue
-
-                # Next character
-                elif GM_input == "/n":
-                    self.next_character()
-                    continue
-
-                # Next turn
-                elif GM_input == "/t":
-                    scene_path = self.agent.get_active_scene_path()
-                    advance_turn(scene_path, self.agent, current_turn=current_turn)
-                    continue
-
-                # Submode shortcuts (/c, /r, /e)
-                elif GM_input.lower() in ("/c", "/r", "/g", "/e"):
-                    if GM_input.lower() == "/c":
-                        self.current_submode = "combat"
-                    elif GM_input.lower() == "/r":
-                        self.current_submode = "roleplay"
-                    elif GM_input.lower() == "/g":
-                        self.current_submode = "group"
-                        self.submode_instruction_text = ""
-                        console.print("[bold cyan]Submode switched to group[/bold cyan]")
-                        continue
-                    else:
-                        self.current_submode = "exploration"
-                        self.submode_instruction_text = self.pm.submode(self.current_submode)
-                        console.print(f"[bold cyan]Submode switched to {self.current_submode}[/bold cyan]")
-                        continue
-
-                # Switch active character by number (/1 /2 /3)
-                elif GM_input.startswith("/") and GM_input[1:].isdigit():
-                    self.switch_character(int(GM_input[1:]))
-                    continue
-
-                elif GM_input == "/end":
-
-                    # Get only the summary string (summarize_full_scene performs LLM calls)
-                    final_summary = self.summarize_full_scene(self.pm.scene_raw)
-
-                    if not final_summary:
-                        console.print("[yellow]No summary returned from summarizer.[/yellow]")
-                        continue
-
-                    # Read original scene
-                    original = self.agent.read_active_scene()
-
-                    # Remove any existing Scene Summary blocks (keep rest)
-                    # Pattern: header "# Scene Summary" (or "## Scene Summary") and any following lines
-                    import re
-                    # Remove any existing Scene Summary section(s)
-                    cleaned = re.sub(
-                        r"(?ms)^\s*#{1,2}\s*Scene Summary\s*\n.*?(?=^\s*#\s*(Turn\s+\d+|Scene Summary)\b|\Z)",
-                        "",
-                        original
-                    ).rstrip()
-
-                    # Detect description vs start at Turn 1
-                    m = re.search(r"^#\s*Turn\s+1\b", cleaned, flags=re.M)
-                    if m:
-                        desc_block = cleaned[:m.start()].strip()
-                        turns_block = cleaned[m.start():].lstrip()
-                    else:
-                        # No Turn 1 found — treat whole file as turns_block fallback
-                        desc_block = ""
-                        turns_block = cleaned.strip()
-
-                    # Build the new scene text: description (if any), Scene Summary, then turns
-                    parts = []
-                    if desc_block:
-                        parts.append(desc_block)
-                    parts.append("# Scene Summary\n" + final_summary.strip())
-                    if turns_block:
-                        parts.append(turns_block)
-
-                    new_scene = "\n\n".join(parts).strip() + "\n"
-
-                    # Write back the scene file (replace)
-                    # Use agent or helper that writes whole scene — replace with your write function
-                    try:
-                        # if your agent has a write_scene or similar, use it. Otherwise overwrite file.
-                        scene_path = self.agent.get_active_scene_path()
-                        scene_path.write_text(new_scene, encoding="utf-8")
-                        # Refresh pm.scene_text and agent internal state if needed
-                        self.pm.scene_raw = new_scene
-                        console.print("\n[bold green]Full scene summary written into scene file.[/bold green]")
-                        console.print("# Scene Summary\n" + final_summary.strip())
-                    except Exception as e:
-                        console.print(f"[red]Failed to write scene file: {e}[/red]")
-                        console.print("# Scene Summary\n" + final_summary.strip())
-
-                    continue
-
-                # Unknown command
-                else:
-                    console.print("[yellow]Unknown command.[/yellow]")
-                    continue
-
-            # Empty input → treat as "GM says nothing" and continue the scene
+            # --------------------------------------------------------
+            # 1) Empty input → auto mode OR send empty input to LLM
+            # --------------------------------------------------------
             if not GM_input:
-                if getattr(self, "auto_mode", False):
-                    self.auto_next_character()   # switches character AND sends empty input
+                if self.auto_mode:
+                    self.auto_next_character()
                 else:
-                    self._send_to_llm("")        # just sends empty input
+                    self._send_to_llm("")
                 continue
 
+            # --------------------------------------------------------
+            # 2) ALL commands (including "*", try again, /p, /x)
+            # --------------------------------------------------------
+            handler, arg = self.parser.parse(GM_input)
+            if handler:
+                handler.execute(self, arg)
+                continue
 
-                # NORMAL FLOW: GM provides input → LLM responds → append to scene
-
-            # Use the helper to send GM input to LLM and append
+            # --------------------------------------------------------
+            # 3) NORMAL FLOW → send GM input to LLM
+            # --------------------------------------------------------
             self._send_to_llm(GM_input)
 
     # ---------- Main ----------
 def main():
     agent = OllamaAgent(vault_root, characters_dir, scenes_active_dir)
-    scene_text = agent.read_active_scene()
     # Create PromptManager
     pm = PromptManager(prompts_dir)
 

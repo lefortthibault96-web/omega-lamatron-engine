@@ -2,11 +2,16 @@ from pathlib import Path
 from rich import print as rprint
 
 DEFAULT_MODEL = "fluffy/l3-8b-stheno-v3.2"
-MODEL = "dolphin3:8b"           # optional, if you need both
-CONTEXT_THRESHOLD = 0.4        # % of context for warnings and auto-summary (0-1)
-SCENE_CONTEXT_THRESHOLD = 0.5 # % of context for scene summaries (0-1)
-AUTO_SUMMARIZE = True           # Automatically summarize when token usage is above context treshold
-TURNS_TO_KEEP = 3               # How many last turns to leave unsummarized
+MODEL = "dolphin3:8b"                   # optional, if you need both
+DEFAULT_TEMPERATURE = 1.1               # how creative the character-playing LLM is allowed to be
+SUMMARY_TEMPERATURE = 0.4               # how creative are summaries allowed to be (keep this lower than default for better results)
+CONTEXT_THRESHOLD = 0.4                 # % of context for warnings and auto-summary (0-1)
+SCENE_CONTEXT_THRESHOLD = 0.8           # % of context for scene summaries (0-1)
+AUTO_SUMMARIZE = True                   # Automatically summarize when token usage is above context treshold
+DYNAMIC_SUMMARY_ALLOW_MIDTURN = True    # True allows summaries mid-turn (as soon as threshold is exceeded), False will only summarize on next turn (/t)
+FULL_TURNS_TO_KEEP = 1                  # How many last turns to leave unsummarized
+MIN_SUMMARY_TURNS_TO_KEEP = 1           
+MAX_SUMMARY_TURNS_TO_KEEP = 5
 HELP_LINES = [
     "/h                   - Show help",
     "/r <dice>            - Roll dice",
