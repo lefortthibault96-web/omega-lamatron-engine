@@ -19,7 +19,7 @@ HELP_LINES = [
     "/e                   - Exploration submode",
     "/r                   - Roleplay submode",
     "/g                   - Group submode",
-    "/s <n>               - Summarize scene. Optionally keep the last N turns unsummarized (default uses config value)",
+    "/s                   - Summarize all unsummarized turns using full text and SCENE_CONTEXT_THRESHOLD",
     "try again <comment>  - Regenerate last LLM message (retry), optional comment is added to last user input as clarification for retries (cumulative)",
     "/ls                  - List characters",
     "/n                   - Next character",
@@ -28,6 +28,7 @@ HELP_LINES = [
     "*                    - Toggle auto-mode (when True, upon empty user input, switches to next character then sends)",
     ".                    - Append GM text in scene file without summoning LLM"
     "/end                 - End scene and launch a batched summary using full turn text (respecting scene context treshold)",
+    "/scrunch             - DESTROYS Scene Summary, summarizing it to a single paragraph to clear accumulated context space",
 ]
 # ---------------------------------------------------------
 # Vault folders
