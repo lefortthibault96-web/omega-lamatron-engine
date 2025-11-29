@@ -163,18 +163,16 @@ def parse_sections(text, token_counter):
 
             current = {
                 "level": len(m.group(1)),
-                "header": m.group(2),
+                "header": m.group(2).strip(),
                 "lines": []
             }
         else:
             if current:
-                current["lines"].append(line.strip())
+                # FIX: keep raw body lines of turns!
+                current["lines"].append(line.rstrip())
             else:
-                current = {
-                    "level": 0,
-                    "header": None,
-                    "lines": [line.strip()]
-                }
+                # ignore text before first header
+                continue
 
     if current:
         current["text"] = "\n".join(current["lines"])

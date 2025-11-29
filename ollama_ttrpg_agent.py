@@ -131,6 +131,10 @@ class GMInterface:
     def show_help(self):
         console.print(HELP_LINES)
         return HELP_LINES
+    
+    def set_submode(self, mode: str):
+        self.current_submode = mode
+        console.print(f"[bold cyan]Submode switched to {mode}[/bold cyan]")
 
     def normalize_llm_output(self, response: str, speaker_name: str) -> str:
         """

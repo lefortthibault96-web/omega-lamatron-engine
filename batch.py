@@ -1,4 +1,5 @@
 import math
+import re
 from utils import (
     SceneDocument,
     extract_description,
@@ -17,6 +18,7 @@ from config import (
     MAX_SUMMARY_TURNS_TO_KEEP,
 )
 
+DEBUG_DYNAMIC_BATCH = True
 
 class BatchManager:
     """
@@ -43,14 +45,41 @@ class BatchManager:
         doc = SceneDocument(text, self.agent.count_tokens_string)
         return doc.sections
 
-    def extract_groups_from_sections(self, sections, header_regex=r"^Turn\s+(\d+)", ignore_case=True):
-        """
-        Groups are extracted using utils.extract_groups indirectly
-        via SceneDocument.
-        """
-        text = "\n".join(sec["text"] for sec in sections)
-        doc = SceneDocument(text, self.agent.count_tokens_string)
-        return doc.turns
+    def extract_groups_from_sections(self, sections, header_regex):
+        if isinstance(header_regex, str):
+            pattern = re.compile(header_regex)
+        else:
+            pattern = header_regex
+
+        groups = []
+        current_group = None
+
+        for sec in sections:
+            header = sec.get("header") or ""
+            m = pattern.match(header)
+
+            # If this section starts a new Turn
+            if m:
+                # Close previous group if any
+                if current_group is not None:
+                    groups.append(current_group)
+
+                turn_index = int(m.group(1))
+
+                current_group = {
+                    "index": turn_index,
+                    "sections": []
+                }
+
+            # Add sections to current group
+            if current_group is not None:
+                current_group["sections"].append(sec)
+
+        # Close last group
+        if current_group is not None:
+            groups.append(current_group)
+
+        return groups
 
     # ---------------------------------------------------------
     # TOKENWISE BATCH HELPERS (unchanged logic)
@@ -245,236 +274,264 @@ class BatchManager:
         scene_text: str,
         threshold_tokens: int,
         ignored_turns=None,
-        system_prompts: list[dict] = None,
+        system_prompts=None,
         default_prompt_builder=None,
     ):
+        # ---------------------------------------------------------
+        # CONFIG FLAG
+        # ---------------------------------------------------------
+        DEBUG_DYNAMIC_BATCH = True
 
         if ignored_turns is None:
             ignored_turns = set()
 
-        # Step 0…
+        # ---------------------------------------------------------
+        # SYSTEM TOKENS
+        # ---------------------------------------------------------
         if system_prompts is None:
             if default_prompt_builder is None:
-                raise ValueError("Must provide default_prompt_builder if system_prompts is None")
+                raise ValueError("Must provide default_prompt_builder")
             system_prompts = default_prompt_builder(scene_text="")
 
         system_tokens = sum(self.agent.count_tokens_string(p["content"]) for p in system_prompts)
         available_tokens = threshold_tokens - system_tokens
         if available_tokens <= 0:
-            raise ValueError(
-                f"System content ({system_tokens} tokens) exceeds total threshold ({threshold_tokens})"
-            )
+            return "", [], []
 
-        # Step 2…  (use utils)
-        sections = parse_sections(scene_text, self.agent.count_tokens_string)
-        turns = extract_groups(sections, header_regex=r"^Turn\s+(\d+)")
+        # ---------------------------------------------------------
+        # PARSE SCENE
+        # ---------------------------------------------------------
+        doc = SceneDocument(scene_text, self.agent.count_tokens_string)
+        sections = doc.sections
+        turns = doc.turns
+        collapsed = doc.collapsed_turns() | ignored_turns
 
-        # Step 3… (use utils.extract_description)
-        raw_desc = extract_description(sections)
-        description_text = f"# Description\n{raw_desc}" if raw_desc else ""
+        # ---------------------------------------------------------
+        # MANDATORY BLOCKS
+        # ---------------------------------------------------------
+        description_text = doc.description() or ""
+        description_block = f"# Description\n{description_text}" if description_text else ""
 
-        # Extract scene summary (utils has no helper for this header, so keep your logic)
         scene_summary_text = ""
         for sec in sections:
-            header = (sec["header"] or "").lower()
-            if header.startswith("scene summary"):
+            if (sec["header"] or "").lower().startswith("scene summary"):
                 scene_summary_text = f"# Scene Summary\n{sec['text']}"
+                break
 
-        # Parse collapsed metadata from the Scene Summary header
-        collapsed_turns = parse_collapsed_turns(scene_text)
-        collapsed = ignored_turns | collapsed_turns
+        # ---------------------------------------------------------
+        # ONGOING TURN (structural rule)
+        # ---------------------------------------------------------
+        inprog_text = ""
+        inprog_idx = None
 
-        # Step 4…
-        uncollapsed_summaries = []
-        full_turn_texts = {}
-        finished_indices = []
-        turn_in_progress_text = None
+        if turns:
+            last = turns[-1]
+            idx = last["index"]
+
+            # Default: assume NOT in-progress
+            inprog_idx = None
+
+            has_summary = any((s["header"] or "").lower() == "summary" for s in last["sections"])
+            has_full    = any((s["header"] or "").lower() == "full turn" for s in last["sections"])
+
+            # Collect body text
+            body_chunks = []
+            for sec in last["sections"]:
+                h = (sec["header"] or "").lower()
+                if h in ("summary", "full turn"):
+                    continue
+                if sec["text"].strip():
+                    body_chunks.append(sec["text"])
+
+            # IN-PROGRESS detection is ONLY here
+            if body_chunks and not has_summary and not has_full:
+                body = "\n\n".join(body_chunks)
+                inprog_text = f"# Turn {idx} (In Progress)\n{body}"
+                inprog_idx = idx     # ✔ Only mark in-progress when it actually is
+
+        # ---------------------------------------------------------
+        # TOKEN COST OF MANDATORY BLOCKS
+        # ---------------------------------------------------------
+        mand_text = "\n\n".join(filter(None, [
+            description_block,
+            scene_summary_text,
+            inprog_text
+        ]))
+
+        mand_cost = self.agent.count_tokens_string(mand_text)
+        remaining = max(0, available_tokens - mand_cost)
+
+        # ---------------------------------------------------------
+        # BUILD CANDIDATE TURNS (excluding collapsed + ongoing)
+        # ---------------------------------------------------------
+        turn_summaries = {}
+        turn_fulls = {}
+        candidate_turns = []
 
         for group in turns:
             idx = group["index"]
-
-                # Utils helper for summary
-            summary = get_turn_summary_text(group)
-
-            # Detect real "Full Turn" section (## Full Turn)
-            has_full = any(
-                (sec.get("header") or "").lower() == "full turn"
-                and sec.get("level") == 2
-                for sec in group["sections"]
-            )
-
-            # Only get full text if "Full Turn" section truly exists
-            full = get_turn_full_text(group) if has_full else None
-
-            # Detect "(In Progress)"
-            first_header = (group["sections"][0]["header"] or "").lower() if group["sections"] else ""
-            is_in_progress = "in progress" in first_header
-
-            # Register summaries
-            if summary and idx not in collapsed:
-                uncollapsed_summaries.append((idx, summary))
-
-            # Register full turns
-            if full and idx not in collapsed:
-                full_turn_texts[idx] = full
-                finished_indices.append(idx)
-
-            # Collect in-progress content (non-summary + non-full)
-            if is_in_progress:
-                chunks = []
-                for sec in group["sections"]:
-                    h = (sec["header"] or "").lower()
-                    if h in ("summary", "full turn"):
-                        continue
-                    if sec["text"].strip():
-                        chunks.append(sec["text"])
-
-                merged = join_blocks(*chunks)
-                turn_in_progress_text = f"# Turn {idx} (In Progress)\n{merged}"
-
-        # Step 5…
-        included_summaries = list(uncollapsed_summaries)
-        included_fulls = []
-        min_full_turns = FULL_TURNS_TO_KEEP
-
-        for idx in reversed(finished_indices):
+            if idx == inprog_idx:
+                continue
             if idx in collapsed:
                 continue
 
-            parts = []
+            summary = get_turn_summary_text(group)
+            full = get_turn_full_text(group)
 
-            if description_text:
-                parts.append(description_text)
-            if scene_summary_text:
-                parts.append(scene_summary_text)
+            if summary:
+                turn_summaries[idx] = summary
+            if full:
+                turn_fulls[idx] = full
 
-            # Summaries except this turn
-            for s_idx, s_txt in included_summaries:
-                if s_idx not in [f_idx for f_idx, _ in included_fulls] and s_idx != idx:
-                    parts.append(f"## Turn {s_idx} Summary\n{s_txt}")
+            candidate_turns.append(idx)
 
-            # Already included full turns
-            for f_idx, f_txt in included_fulls:
-                parts.append(f"# Turn {f_idx}\n{f_txt}")
+        candidate_turns.sort()
 
-            # Candidate full turn
-            parts.append(f"# Turn {idx}\n{full_turn_texts[idx]}")
+        # ---------------------------------------------------------
+        # REQUIRED FULLS / SUMMARIES
+        # ---------------------------------------------------------
+        # Required full turns = newest N fulls
+        full_candidates = [i for i in candidate_turns if i in turn_fulls]
+        if FULL_TURNS_TO_KEEP > 0:
+            required_full = sorted(full_candidates)[-FULL_TURNS_TO_KEEP:]
+        else:
+            required_full = []
+        required_full = sorted(required_full)
 
-            if turn_in_progress_text:
-                parts.append(turn_in_progress_text)
+        # Required summaries = oldest M summaries
+        summary_candidates = [i for i in candidate_turns
+                            if i not in required_full and i in turn_summaries]
 
-            test_text = join_blocks(*parts)
-            if self.agent.count_tokens_string(test_text) <= available_tokens:
-                included_fulls.append((idx, full_turn_texts[idx]))
+        if MIN_SUMMARY_TURNS_TO_KEEP > 0:
+            required_summaries = summary_candidates[:MIN_SUMMARY_TURNS_TO_KEEP]
+        else:
+            required_summaries = []
+        required_summaries = sorted(required_summaries)
+
+        # ---------------------------------------------------------
+        # BASELINE CONFIG: ALL SUMMARIES (minus required full)
+        # ---------------------------------------------------------
+        current_fulls = set(required_full)
+        current_summaries = set(
+            idx for idx in candidate_turns
+            if idx not in current_fulls and idx in turn_summaries
+        )
+        current_summaries |= set(required_summaries)
+
+        # Prepare baseline blocks
+        def build_blocks(summary_set, full_set):
+            blocks = []
+            for i in sorted(summary_set):
+                blocks.append(f"## Turn {i} Summary\n{turn_summaries[i]}")
+            for i in sorted(full_set):
+                blocks.append(f"# Turn {i}\n{turn_fulls[i]}")
+            return blocks
+
+        baseline_blocks = build_blocks(current_summaries, current_fulls)
+        baseline_text = mand_text + "\n\n" + "\n\n".join(baseline_blocks)
+        baseline_cost = self.agent.count_tokens_string(baseline_text)
+
+        # ---------------------------------------------------------
+        # IF BASELINE TOO LARGE → RETURN BASELINE AS-IS
+        # ---------------------------------------------------------
+        if baseline_cost > threshold_tokens:
+            if DEBUG_DYNAMIC_BATCH:
+                print("\n===== DYNAMIC BATCH DEBUG (BASELINE ONLY — TOO LARGE) =====")
+                print(f"Summaries: {sorted(current_summaries)}")
+                print(f"Fulls    : {sorted(current_fulls)}")
+                print(f"Usage    : {baseline_cost} / {threshold_tokens}")
+                print("===========================================================\n")
+
+            # final assembly
+            final_parts = [p for p in [
+                description_block,
+                scene_summary_text,
+                "\n\n".join(baseline_blocks),
+                inprog_text
+            ] if p]
+
+            final_text = "\n\n".join(final_parts).strip()
+
+            # dropped-turn detection
+            original_summary = set(turn_summaries.keys())
+            included_summary = set(current_summaries)
+            included_full = set(current_fulls)
+            dropped = original_summary - included_summary - included_full
+
+            if dropped:
+                return None, None, dropped
+
+            return final_text, [(i, turn_summaries[i]) for i in sorted(current_summaries)], [(i, turn_fulls[i]) for i in sorted(current_fulls)]
+
+        # ---------------------------------------------------------
+        # BASELINE FITS → TRY FULL-TURN UPGRADES (NEWEST→OLDEST)
+        # ---------------------------------------------------------
+        best_cost = baseline_cost
+        best_fulls = sorted(current_fulls)
+        best_summaries = sorted(current_summaries)
+
+        for idx in reversed(candidate_turns):
+            # Upgrade summary→full if possible
+            if idx in turn_fulls:
+                current_fulls.add(idx)
+            if idx in current_summaries:
+                current_summaries.remove(idx)
+
+            blocks = build_blocks(current_summaries, current_fulls)
+            cfg_text = mand_text + "\n\n" + "\n\n".join(blocks)
+            cfg_cost = self.agent.count_tokens_string(cfg_text)
+
+            if cfg_cost <= threshold_tokens and cfg_cost > best_cost:
+                best_cost = cfg_cost
+                best_fulls = sorted(current_fulls)
+                best_summaries = sorted(current_summaries)
             else:
+                # Stop upgrading once over budget
                 break
 
-        # Minimum full-turn guarantee
-        if len(included_fulls) < min_full_turns and finished_indices:
-            for newest in reversed(finished_indices):
-                if newest not in collapsed:
-                    included_fulls = [(newest, full_turn_texts[newest])]
-                    break
+        # ---------------------------------------------------------
+        # FINAL ASSEMBLY (AFTER UPGRADES)
+        # ---------------------------------------------------------
+        final_blocks = build_blocks(best_summaries, best_fulls)
 
-        # Remove summaries that have full turns
-        full_indices = {idx for idx, _ in included_fulls}
-        included_summaries = [
-            (idx, txt) for (idx, txt) in included_summaries
-            if idx not in full_indices and idx not in collapsed
-        ]
-        included_summaries.sort(key=lambda x: x[0])
+        final_parts = [p for p in [
+            description_block,
+            scene_summary_text,
+            "\n\n".join(final_blocks),
+            inprog_text
+        ] if p]
 
-        # Enforce MAX summary limit
-        if MAX_SUMMARY_TURNS_TO_KEEP is not None and len(included_summaries) > MAX_SUMMARY_TURNS_TO_KEEP:
-            included_summaries = included_summaries[-MAX_SUMMARY_TURNS_TO_KEEP:]
+        final_text = "\n\n".join(final_parts).strip()
 
-        # Enforce MIN summary limit
-        if MIN_SUMMARY_TURNS_TO_KEEP is not None and len(included_summaries) < MIN_SUMMARY_TURNS_TO_KEEP:
-            shortage = MIN_SUMMARY_TURNS_TO_KEEP - len(included_summaries)
+        if DEBUG_DYNAMIC_BATCH:
+            print("\n===== DYNAMIC BATCH DEBUG (FINAL CONFIG) =====")
+            print(f"Summaries: {best_summaries}")
+            print(f"Fulls    : {best_fulls}")
+            print(f"Usage    : {best_cost} / {threshold_tokens}")
+            print("==============================================\n")
 
-            # Only consider candidates that are:
-            #  - not already included as full
-            #  - not ignored/collapsed
-            candidates = [
-                (idx, txt)
-                for (idx, txt) in sorted(uncollapsed_summaries, key=lambda x: x[0])
-                if idx not in full_indices and idx not in collapsed
-            ]
+            # ---------------------------------------------------------
+            # ENFORCE MAX SUMMARY KEEP
+            # ---------------------------------------------------------
+        if MAX_SUMMARY_TURNS_TO_KEEP is not None:
+                if len(best_summaries) > MAX_SUMMARY_TURNS_TO_KEEP:
+                    # oldest ones get dropped
+                    num_to_drop = len(best_summaries) - MAX_SUMMARY_TURNS_TO_KEEP
+                    dropped = set(best_summaries[:num_to_drop])
+                    return None, None, dropped
 
-            needed = []
-            for s in reversed(candidates):
-                if s not in included_summaries:
-                    needed.append(s)
-                if len(needed) >= shortage:
-                    break
+        # dropped-turn detection
+        original_summary = set(turn_summaries.keys())
+        included_summary = set(best_summaries)
+        included_full = set(best_fulls)
+        dropped = original_summary - included_summary - included_full
 
-            included_summaries.extend(reversed(needed))
+        if dropped:
+            return None, None, dropped
 
-        included_summaries.sort(key=lambda x: x[0])
+        return (
+            final_text,
+            [(i, turn_summaries[i]) for i in best_summaries],
+            [(i, turn_fulls[i]) for i in best_fulls]
+        )
 
-        # SPECIAL CASE: total collapse
-        if not uncollapsed_summaries and not full_turn_texts:
-            if MIN_SUMMARY_TURNS_TO_KEEP > 0:
-                summary_text = scene_summary_text.replace("# Scene Summary", "").strip()
-                words = summary_text.split()
-
-                if not words:
-                    final_parts = []
-                    if description_text:
-                        final_parts.append(description_text)
-                    final_parts.append(f"# Scene Summary\n{summary_text}")
-                    final_text = join_blocks(*final_parts)
-                    return final_text, [], []
-
-                chunk_size = max(1, len(words) // MIN_SUMMARY_TURNS_TO_KEEP)
-                synthetic_summaries = []
-
-                for i in range(MIN_SUMMARY_TURNS_TO_KEEP):
-                    chunk = words[i * chunk_size : (i + 1) * chunk_size]
-                    if not chunk:
-                        break
-                    synthetic_summaries.append((i + 1, " ".join(chunk)))
-
-                final_parts = []
-                if description_text:
-                    final_parts.append(description_text)
-                final_parts.append(f"# Scene Summary\n{summary_text}")
-
-                for idx, txt in synthetic_summaries:
-                    final_parts.append(f"## Turn {idx} Summary\n{txt}")
-
-                if turn_in_progress_text:
-                    final_parts.append(turn_in_progress_text)
-
-                final_text = join_blocks(*final_parts)
-                return final_text, synthetic_summaries, []
-
-        # Detect dropped turns
-        original_summary_indices = {idx for idx, _ in uncollapsed_summaries}
-        included_summary_indices = {idx for idx, _ in included_summaries}
-        included_full_indices = {idx for idx, _ in included_fulls}
-
-        dropped_turns = original_summary_indices - included_summary_indices - included_full_indices
-        if dropped_turns:
-            return None, None, dropped_turns
-
-        # Step 6: final assembly
-        final_parts = []
-
-        if description_text:
-            final_parts.append(description_text)
-        if scene_summary_text:
-            final_parts.append(scene_summary_text)
-
-        for s_idx, s_txt in included_summaries:
-            if s_idx not in full_indices:
-                final_parts.append(f"## Turn {s_idx} Summary\n{s_txt}")
-
-        for f_idx, f_txt in included_fulls:
-            final_parts.append(f"# Turn {f_idx}\n{f_txt}")
-
-        if turn_in_progress_text:
-            final_parts.append(turn_in_progress_text)
-
-        final_text = join_blocks(*final_parts)
-        return final_text, included_summaries, included_fulls

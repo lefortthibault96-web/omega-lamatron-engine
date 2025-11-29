@@ -70,6 +70,10 @@ class CommandParser:
         if text[1:].isdigit():
             cmd = self.registry.get("/digit")
             return cmd, text[1:]
+        
+        if lower in ("/c", "/r", "/g", "/e"):
+            cmd = self.registry.get("/submode")
+            return cmd, lower
 
         # Dice roll: /r X
         if text.startswith("/r "):
@@ -188,6 +192,22 @@ class ScrunchCommand(GMCommand):
         from turns import scrunch
         scrunch(gm.agent, gm.pm)
 
+class SubmodeCommand(GMCommand):
+    name = "/submode"   # internal router key
+
+    def execute(self, gm, arg):
+        mapping = {
+            "/c": "combat",
+            "/r": "roleplay",
+            "/g": "group",
+            "/e": "exploration",
+        }
+        mode = mapping.get(arg.lower())
+        if mode:
+            gm.set_submode(mode)
+        else:
+            gm.console.print(f"[red]Unknown submode: {arg}[/red]")
+
 
 # ============================================================
 # REGISTER ALL COMMANDS FOR GMInterface
@@ -208,5 +228,6 @@ def build_default_registry():
     registry.register(UnknownCommand())
     registry.register(RetryCommand())
     registry.register(ScrunchCommand())
+    registry.register(SubmodeCommand())
 
     return registry
